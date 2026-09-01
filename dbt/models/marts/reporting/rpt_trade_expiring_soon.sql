@@ -25,16 +25,16 @@ with live_and_maturing as (
 
     select * from {{ ref('fct_trade') }}
     where maturity_date is not null
-      and (
-          -- Maturing within the window.
-          (
-              lifecycle_status = 'LIVE'
-              and maturity_date between {{ business_date }}
-                  and dateadd('day', {{ var('expiring_soon_days') }}, {{ business_date }})
-          )
-          -- Or already matured but not yet transitioned -- the canary.
-          or (lifecycle_status = 'LIVE' and maturity_date < {{ business_date }})
-      )
+        and (
+            -- Maturing within the window.
+            (
+                lifecycle_status = 'LIVE'
+                and maturity_date between {{ business_date }}
+                and dateadd('day', {{ var('expiring_soon_days') }}, {{ business_date }})
+            )
+            -- Or already matured but not yet transitioned -- the canary.
+            or (lifecycle_status = 'LIVE' and maturity_date < {{ business_date }})
+        )
 
 ),
 

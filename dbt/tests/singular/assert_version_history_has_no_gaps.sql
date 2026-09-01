@@ -37,7 +37,10 @@ with_previous as (
     select
         trade_id,
         trade_version,
-        lag(trade_version) over (partition by trade_id order by trade_version) as previous_version
+        lag(trade_version) over (
+            partition by trade_id
+            order by trade_version
+        ) as previous_version
     from versions
 
 ),
@@ -51,7 +54,7 @@ gaps as (
         trade_version - previous_version - 1 as missing_version_count
     from with_previous
     where previous_version is not null
-      and trade_version > previous_version + 1
+        and trade_version > previous_version + 1
 
 ),
 
@@ -94,8 +97,8 @@ gap_explanations as (
     from all_gaps
     left join {{ ref('fct_trade_rejected') }} as rejected
         on all_gaps.trade_id = rejected.trade_id
-        and all_gaps.previous_version < rejected.trade_version
-        and all_gaps.next_version > rejected.trade_version
+            and all_gaps.previous_version < rejected.trade_version
+            and all_gaps.next_version > rejected.trade_version
     group by
         all_gaps.trade_id,
         all_gaps.previous_version,

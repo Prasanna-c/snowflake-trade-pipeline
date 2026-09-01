@@ -63,10 +63,10 @@ rule_totals as (
     select
         by_rule_and_source.*,
 
-        sum(hit_count) over (partition by rule_code) as rule_total_hits,
-        sum(hit_count) over () as all_rules_total_hits,
-        sum(hits_last_7d) over (partition by rule_code) as rule_hits_last_7d,
-        count(*) over (partition by rule_code) as sources_affected
+        sum(by_rule_and_source.hit_count) over (partition by by_rule_and_source.rule_code) as rule_total_hits,
+        sum(by_rule_and_source.hit_count) over () as all_rules_total_hits,
+        sum(by_rule_and_source.hits_last_7d) over (partition by by_rule_and_source.rule_code) as rule_hits_last_7d,
+        count(*) over (partition by by_rule_and_source.rule_code) as sources_affected
 
     from by_rule_and_source
 
@@ -78,15 +78,18 @@ with_shares as (
         rule_totals.*,
 
         -- Share of this rule's hits attributable to this source system.
-        round(100.0 * hit_count / nullif(rule_total_hits, 0), 2) as share_of_rule_pct,
+        round(100.0 * rule_totals.hit_count / nullif(rule_totals.rule_total_hits, 0), 2) as share_of_rule_pct,
 
         -- Share of all hits attributable to this rule.
-        round(100.0 * rule_total_hits / nullif(all_rules_total_hits, 0), 2) as rule_share_of_all_pct,
+        round(100.0 * rule_totals.rule_total_hits / nullif(rule_totals.all_rules_total_hits, 0), 2)
+            as rule_share_of_all_pct,
 
         -- Rank rules by recent volume, so a dashboard can show "top 5 problems now"
         -- rather than "top 5 problems since inception", which stops being actionable
         -- after the first month.
-        dense_rank() over (order by rule_hits_last_7d desc) as rule_rank_last_7d
+        dense_rank() over (
+            order by rule_totals.rule_hits_last_7d desc
+        ) as rule_rank_last_7d
 
     from rule_totals
 

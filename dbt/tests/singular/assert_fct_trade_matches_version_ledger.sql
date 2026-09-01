@@ -47,7 +47,7 @@ ledger_current as (
     from {{ ref('fct_trade_version') }} as ledger
     inner join ledger_max
         on ledger.trade_id = ledger_max.trade_id
-        and ledger.trade_version = ledger_max.max_version
+            and ledger.trade_version = ledger_max.max_version
 
 ),
 

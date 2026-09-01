@@ -30,7 +30,9 @@ with date_spine as (
         question is whether the pipeline stopped.
     */
     select
-        dateadd('day', -1 * row_number() over (order by seq4()), current_date() + 1) as calendar_date
+        dateadd('day', -1 * row_number() over (
+            order by seq4()
+        ), current_date() + 1) as calendar_date
     from table(generator(rowcount => 400))
 
 ),

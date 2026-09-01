@@ -76,16 +76,16 @@ newly_accepted as (
     select *
     from {{ ref('fct_trade_version') }}
 
-{% if is_incremental() %}
+    {% if is_incremental() %}
     where dbt_updated_at > (
-        select coalesce(max(dbt_updated_at), '1900-01-01'::timestamp_ltz) from {{ this }}
-    )
-{% endif %}
+            select coalesce(max(t.dbt_updated_at), '1900-01-01'::timestamp_ltz) from {{ this }} as t
+        )
+    {% endif %}
 
     qualify row_number() over (
-        partition by trade_id
-        order by trade_version desc, event_timestamp desc, event_sk desc
-    ) = 1
+            partition by trade_id
+            order by trade_version desc, event_timestamp desc, event_sk desc
+        ) = 1
 
 ),
 
@@ -95,19 +95,20 @@ newly_accepted as (
 -- ---------------------------------------------------------------------------
 needs_expiry as (
 
-{% if is_incremental() %}
+    {% if is_incremental() %}
     select existing.*
     from {{ this }} as existing
     where existing.maturity_date is not null
-      and existing.maturity_date < {{ business_date }}
-      and existing.lifecycle_status = 'LIVE'
-      -- Exclude trades that population (a) is about to rewrite. Without this a trade
-      -- both amended today and past maturity would appear twice in the merge source,
-      -- and Snowflake would reject the non-deterministic MERGE.
-      and not exists (
-          select 1 from newly_accepted as na where na.trade_id = existing.trade_id
-      )
-{% else %}
+        and existing.maturity_date < {{ business_date }}
+        and existing.lifecycle_status = 'LIVE'
+        -- Exclude trades that population (a) is about to rewrite. Without this a trade
+        -- both amended today and past maturity would appear twice in the merge source,
+        -- and Snowflake would reject the non-deterministic MERGE.
+        and not exists (
+            select 1 from newly_accepted as na
+            where na.trade_id = existing.trade_id
+        )
+    {% else %}
     select
         cast(null as varchar) as trade_id
     where false
@@ -194,7 +195,7 @@ from_new_events as (
 -- ---------------------------------------------------------------------------
 from_expiry_sweep as (
 
-{% if is_incremental() %}
+    {% if is_incremental() %}
     select
         needs_expiry.trade_id,
         needs_expiry.current_version,
@@ -250,7 +251,7 @@ from_expiry_sweep as (
         '{{ invocation_id }}' as dbt_invocation_id
 
     from needs_expiry
-{% else %}
+    {% else %}
     select * from from_new_events where false
 {% endif %}
 
@@ -283,8 +284,8 @@ final as (
         combined.lifecycle_status = 'LIVE'
         and combined.maturity_date is not null
         and combined.maturity_date
-            between {{ business_date }}
-            and dateadd('day', {{ var('expiring_soon_days') }}, {{ business_date }})
+        between {{ business_date }}
+        and dateadd('day', {{ var('expiring_soon_days') }}, {{ business_date }})
             as is_expiring_soon,
 
         current_timestamp() as dbt_updated_at

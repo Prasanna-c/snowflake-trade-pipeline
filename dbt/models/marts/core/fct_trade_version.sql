@@ -31,18 +31,20 @@
     )
 }}
 
+{% set version_key = ['deduplicated.trade_id', 'deduplicated.trade_version'] %}
+
 with accepted as (
 
     select * from {{ ref('int_trade_event_adjudicated') }}
     where verdict = 'ACCEPTED'
-      and trade_id is not null
-      and trade_version is not null
+        and trade_id is not null
+        and trade_version is not null
 
-{% if is_incremental() %}
-      -- Bounded incremental scan. Correctness comes from the merge key, so this is a
-      -- performance filter rather than a load-bearing one.
-      and adjudicated_at > (select coalesce(max(dbt_updated_at), '1900-01-01'::timestamp_ltz) from {{ this }})
-{% endif %}
+    {% if is_incremental() %}
+    -- Bounded incremental scan. Correctness comes from the merge key, so this is a
+    -- performance filter rather than a load-bearing one.
+    and adjudicated_at > (select coalesce(max(t.dbt_updated_at), '1900-01-01'::timestamp_ltz) from {{ this }} as t)
+    {% endif %}
 
 ),
 
@@ -61,9 +63,9 @@ deduplicated as (
     select *
     from accepted
     qualify row_number() over (
-        partition by trade_id, trade_version
-        order by effective_event_ts desc, batch_seq desc, event_sk desc
-    ) = 1
+            partition by trade_id, trade_version
+            order by effective_event_ts desc, batch_seq desc, event_sk desc
+        ) = 1
 
 ),
 
@@ -71,7 +73,7 @@ final as (
 
     select
         -- Grain -------------------------------------------------------------
-        {{ dbt_utils.generate_surrogate_key(['trade_id', 'trade_version']) }} as trade_version_sk,
+        {{ dbt_utils.generate_surrogate_key(version_key) }} as trade_version_sk,
         deduplicated.trade_id,
         deduplicated.trade_version,
         deduplicated.action,

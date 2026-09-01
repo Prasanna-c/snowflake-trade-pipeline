@@ -108,7 +108,7 @@ canary_masked as (
         || 'models/marts/reporting/rpt_data_quality_scorecard.sql.' as discrepancy
     from both_layers
     where both_layers.overdue_expiry_trades > 0
-      and both_layers.overall_status <> 'RED'
+        and both_layers.overall_status <> 'RED'
 
 )
 

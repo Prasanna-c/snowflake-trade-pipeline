@@ -68,27 +68,31 @@ with actual_columns as (
     select lower(column_name) as column_name
     from {{ target.database }}.information_schema.columns
     where lower(table_schema) = lower('{{ generate_schema_name("core", none) }}')
-      and lower(table_name) = lower('{{ ref("fct_trade").identifier }}')
+        and lower(table_name) = lower('{{ ref("fct_trade").identifier }}')
 
 ),
 
 declared as (
 
     select column1 as column_name
-    from values
+    from
+        values
     {%- for col in snapshot_check_cols %}
-        ('{{ col }}'){{ "," if not loop.last }}
-    {%- endfor %}
+    ('{{ col }}'){{ "," if not loop.last }} -- noqa: LT02
+    
+{%- endfor %}
 
 ),
 
 excluded as (
 
     select column1 as column_name
-    from values
+    from
+        values
     {%- for col in excluded_columns.keys() %}
-        ('{{ col }}'){{ "," if not loop.last }}
-    {%- endfor %}
+    ('{{ col }}'){{ "," if not loop.last }} -- noqa: LT02
+    
+{%- endfor %}
 
 ),
 
@@ -102,7 +106,7 @@ uncovered as (
     left join declared on actual_columns.column_name = declared.column_name
     left join excluded on actual_columns.column_name = excluded.column_name
     where declared.column_name is null
-      and excluded.column_name is null
+        and excluded.column_name is null
 
 ),
 

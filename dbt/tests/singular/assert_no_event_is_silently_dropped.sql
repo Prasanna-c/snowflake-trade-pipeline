@@ -94,7 +94,7 @@ orphaned as (
                 select 1
                 from {{ ref('fct_trade_version') }} as fv
                 where fv.trade_id = adjudicated.trade_id
-                  and fv.trade_version = adjudicated.trade_version
+                    and fv.trade_version = adjudicated.trade_version
             )
         )
         -- A rejected or superseded event must be in AUDIT, with no exceptions at all.

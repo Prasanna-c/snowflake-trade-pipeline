@@ -28,14 +28,16 @@ with macro_rules as (
         column1 as rule_code,
         column2 as severity,
         column3 as rule_name
-    from values
+    from
+        values
     {%- for rule in rules %}
-        (
-            '{{ rule['code'] }}',
-            '{{ rule['severity'] }}',
-            '{{ rule['name'] | replace("'", "''") }}'
-        ){{ "," if not loop.last }}
-    {%- endfor %}
+    (
+        '{{ rule['code'] }}',
+        '{{ rule['severity'] }}',
+        '{{ rule['name'] | replace("'", "''") }}'
+    ){{ "," if not loop.last }} -- noqa: LT02
+    
+{%- endfor %}
 
 ),
 

@@ -54,7 +54,7 @@ rejection_activity as (
         count(*) as rejected_event_count
     from {{ ref('fct_trade_rejected') }}
     where product_type is not null
-      and disposition = 'REJECTED'
+        and disposition = 'REJECTED'
     group by product_type
 
 ),

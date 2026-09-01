@@ -79,16 +79,16 @@ with
 -- ---------------------------------------------------------------------------
 prior_state as (
 
-{% if is_incremental() %}
+    {% if is_incremental() %}
     select
         trade_id,
         max(trade_version) as prior_version,
         max(iff(action = 'CANCEL', 1, 0)) = 1 as prior_is_cancelled
     from {{ this }}
     where verdict = 'ACCEPTED'
-      and trade_id is not null
+        and trade_id is not null
     group by trade_id
-{% else %}
+    {% else %}
     -- Typed empty relation so the joins below compile identically in both branches.
     select
         cast(null as varchar) as trade_id,
@@ -116,9 +116,9 @@ pending as (
 
     select * from {{ ref('int_trade_event_typed') }}
 
-{% if is_incremental() %}
-    where batch_seq > (select coalesce(max(batch_seq), 0) from {{ this }})
-{% endif %}
+    {% if is_incremental() %}
+    where batch_seq > (select coalesce(max(t.batch_seq), 0) from {{ this }} as t)
+    {% endif %}
 
 ),
 
@@ -221,22 +221,22 @@ ranked as (
                 and field_verdict.trade_id is not null
                 and field_verdict.trade_version is not null
                 then row_number() over (
-                    -- is_field_valid belongs in the PARTITION, not only in the CASE that
-                    -- consumes the result. A window function ranks every row of its
-                    -- partition; filtering afterwards does not remove the malformed
-                    -- arrivals from the ordering. With them present, a corrupt resend
-                    -- stamped later took rank 1 and pushed the good event to rank 2 --
-                    -- superseding a valid trade in favour of a rejected one, which is the
-                    -- exact opposite of the intent stated above.
-                    partition by
-                        field_verdict.trade_id,
-                        field_verdict.trade_version,
-                        field_verdict.is_field_valid
-                    order by
-                        field_verdict.effective_event_ts desc,
-                        field_verdict.batch_seq desc,
-                        field_verdict.event_sk desc
-                )
+                        -- is_field_valid belongs in the PARTITION, not only in the CASE that
+                        -- consumes the result. A window function ranks every row of its
+                        -- partition; filtering afterwards does not remove the malformed
+                        -- arrivals from the ordering. With them present, a corrupt resend
+                        -- stamped later took rank 1 and pushed the good event to rank 2 --
+                        -- superseding a valid trade in favour of a rejected one, which is the
+                        -- exact opposite of the intent stated above.
+                        partition by
+                            field_verdict.trade_id,
+                            field_verdict.trade_version,
+                            field_verdict.is_field_valid
+                        order by
+                            field_verdict.effective_event_ts desc,
+                            field_verdict.batch_seq desc,
+                            field_verdict.event_sk desc
+                    )
             else 1
         end as intra_run_rank
 

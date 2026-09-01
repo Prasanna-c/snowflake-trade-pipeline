@@ -40,17 +40,17 @@ with rejected_events as (
     select * from {{ ref('int_trade_event_adjudicated') }}
     where verdict in ('REJECTED', 'SUPERSEDED')
 
-{% if is_incremental() %}
-      -- Append-only, so the watermark IS load-bearing here: without it, every run would
-      -- duplicate the entire history. Using the adjudication timestamp rather than the
-      -- batch sequence because rows can be re-adjudicated by a full refresh upstream.
-      --
-      -- Note the column names differ either side of the comparison: this model stores the
-      -- adjudication timestamp as `rejected_at`. Writing max(adjudicated_at) here would
-      -- not fail loudly -- SQL resolves the unqualified name against the outer query
-      -- instead, turning the subquery into a correlated aggregate that Snowflake rejects.
-      and adjudicated_at > (select coalesce(max(rejected_at), '1900-01-01'::timestamp_ltz) from {{ this }})
-{% endif %}
+    {% if is_incremental() %}
+    -- Append-only, so the watermark IS load-bearing here: without it, every run would
+    -- duplicate the entire history. Using the adjudication timestamp rather than the
+    -- batch sequence because rows can be re-adjudicated by a full refresh upstream.
+    --
+    -- Note the column names differ either side of the comparison: this model stores the
+    -- adjudication timestamp as `rejected_at`. Writing max(adjudicated_at) here would
+    -- not fail loudly -- SQL resolves the unqualified name against the outer query
+    -- instead, turning the subquery into a correlated aggregate that Snowflake rejects.
+    and adjudicated_at > (select coalesce(max(t.rejected_at), '1900-01-01'::timestamp_ltz) from {{ this }} as t)
+    {% endif %}
 
 ),
 
@@ -103,13 +103,13 @@ primary_rule as (
 
     from rejected_events,
         lateral flatten(input => rejected_events.violated_rule_codes) as violated
-    join reject_rule_precedence
+    inner join reject_rule_precedence
         on reject_rule_precedence.rule_code = violated.value::varchar
 
     qualify row_number() over (
-        partition by rejected_events.event_sk
-        order by reject_rule_precedence.category_rank, reject_rule_precedence.rule_code
-    ) = 1
+            partition by rejected_events.event_sk
+            order by reject_rule_precedence.category_rank, reject_rule_precedence.rule_code
+        ) = 1
 
 ),
 
@@ -133,7 +133,7 @@ with_reasons as (
 
     from rejected_events
     left join primary_rule
-        on primary_rule.event_sk = rejected_events.event_sk
+        on rejected_events.event_sk = primary_rule.event_sk
 
 ),
 

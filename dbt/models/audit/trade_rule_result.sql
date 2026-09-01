@@ -32,9 +32,9 @@ with adjudicated as (
     select * from {{ ref('int_trade_event_adjudicated') }}
     where array_size(violated_rule_codes) > 0
 
-{% if is_incremental() %}
-      and adjudicated_at > (select coalesce(max(evaluated_at), '1900-01-01'::timestamp_ltz) from {{ this }})
-{% endif %}
+    {% if is_incremental() %}
+    and adjudicated_at > (select coalesce(max(t.evaluated_at), '1900-01-01'::timestamp_ltz) from {{ this }} as t)
+    {% endif %}
 
 ),
 

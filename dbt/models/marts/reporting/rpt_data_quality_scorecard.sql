@@ -72,10 +72,10 @@ queue_depth as (
     select count(*) as pending_events
     from {{ source('raw', 'trade_event_queue') }} as q
     where not exists (
-        select 1
-        from {{ ref('int_trade_event_adjudicated') }} as a
-        where a.event_sk = q.event_sk
-    )
+            select 1
+            from {{ ref('int_trade_event_adjudicated') }} as a
+            where a.event_sk = q.event_sk
+        )
 
 ),
 
@@ -93,8 +93,7 @@ rule_coverage as (
     -- Which of the declared rules have ever actually fired. A rule that has never fired
     -- is either genuinely never violated or is silently broken, and the two look
     -- identical from a passing test suite.
-    select
-        count(distinct rule_code) as rules_ever_fired
+    select count(distinct rule_code) as rules_ever_fired
     from {{ ref('trade_rule_result') }}
 
 ),
@@ -168,14 +167,14 @@ final as (
             when timestampdiff('minute', event_totals.last_adjudicated_at, current_timestamp()) > 180
                 then 'RED'
             when round(
-                100.0 * event_totals.rejected_last_24h / nullif(event_totals.events_last_24h, 0), 2
-            ) > 25 then 'RED'
+                    100.0 * event_totals.rejected_last_24h / nullif(event_totals.events_last_24h, 0), 2
+                ) > 25 then 'RED'
             when queue_depth.pending_events > 10000 then 'AMBER'
             when timestampdiff('minute', event_totals.last_adjudicated_at, current_timestamp()) > 90
                 then 'AMBER'
             when round(
-                100.0 * event_totals.rejected_last_24h / nullif(event_totals.events_last_24h, 0), 2
-            ) > 15 then 'AMBER'
+                    100.0 * event_totals.rejected_last_24h / nullif(event_totals.events_last_24h, 0), 2
+                ) > 15 then 'AMBER'
             when parse_errors.parse_errors_last_24h > 0 then 'AMBER'
             else 'GREEN'
         end as overall_status,

@@ -57,7 +57,7 @@ rejection_activity as (
         max(rejected_at) as last_rejected_at
     from {{ ref('fct_trade_rejected') }}
     where counterparty_id is not null
-      and disposition = 'REJECTED'
+        and disposition = 'REJECTED'
     group by counterparty_id
 
 ),
