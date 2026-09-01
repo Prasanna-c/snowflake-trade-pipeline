@@ -357,22 +357,17 @@ jobs:
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_CI_DATABASE }}
         run: sqlfluff lint models snapshots tests --format github-annotation-native
 
-      - name: dbt build
-        working-directory: dbt
+      - name: Load a batch
+        # What makes this tier worth its credits: events are generated, staged, COPYed into RAW
+        # and the stream drained, so dbt build transforms data this run produced and the
+        # reconciler has a manifest of expected verdicts to grade the result against.
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_CI_USER }}
           SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_CI_ROLE }}
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_CI_WAREHOUSE }}
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_CI_DATABASE }}
-        # `--full-refresh` because a PR schema is new every time, so there is no incremental
-        # state to preserve and an incremental model would otherwise build empty and pass its
-        # tests vacuously.
-        #
-        # `--store-failures` so a failing test's offending rows are queryable rather than
-        # merely counted, which is the difference between a debuggable CI failure and a rerun.
-        run: |
-          dbt build --target ci --full-refresh --store-failures
+        run: python -m trade_sim.cli load --trades 1000 --batches 1 --run-id ci-${{ github.run_id }}
 
       - name: Reconcile
         # The check no dbt test can perform: compare the generator's ground-truth manifest
