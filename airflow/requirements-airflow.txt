@@ -1,0 +1,46 @@
+# =============================================================================
+# Installed into the Airflow image UNDER Airflow's constraint file.
+#
+# Deliberately minimal. Every package added to an Airflow image is a package that can
+# conflict with a provider on the next upgrade, so this list contains only what the DAGs
+# actually import. dbt and the trade simulator are installed in separate Dockerfile steps
+# for the reasons documented there.
+#
+# WHY ALMOST NOTHING HERE CARRIES A VERSION.
+#
+# The constraint file already pins every package in Airflow's dependency graph to the
+# combination Airflow tested and released. Pinning a version here as well does not reinforce
+# that -- it contradicts it, and pip refuses to resolve the contradiction rather than choosing
+# a winner:
+#
+#     The user requested apache-airflow-providers-snowflake==5.8.1
+#     The user requested (constraint) apache-airflow-providers-snowflake==6.0.0
+#     ERROR: ResolutionImpossible
+#
+# It is not a conflict that can be avoided by picking a better number, either. Bumping
+# `AIRFLOW_VERSION` moves the constraint file, and any pin here that the new file disagrees
+# with breaks the build. So the rule for this file is: name the packages, let the constraint
+# file choose the versions, and pin only what the constraint file does not govern.
+#
+# The build is still reproducible, because the constraints are keyed to an exact Airflow
+# version and are immutable once released.
+# =============================================================================
+
+# Snowflake provider. Not used by the DAGs for connections -- they use trade_sim's session,
+# so there is one implementation of connection handling rather than two -- but it provides
+# the connection type and UI integration, which is worth having for ad-hoc operator use.
+# Constrained to 6.0.0 by Airflow 2.10.5.
+apache-airflow-providers-snowflake
+
+# Key-pair authentication. Constrained to 42.0.8.
+cryptography
+
+# Used by trade_sim's config and schema. Named here so the constraint solver sees them at
+# image-build time rather than resolving them during the editable install. Airflow constrains
+# pydantic to 2.10.6, which satisfies the simulator's `>=2.10`.
+pydantic
+
+# Absent from Airflow's constraint file, so this one is pinned here: nothing else would fix
+# the version, and an unpinned dependency outside the constraints makes the image
+# non-reproducible.
+pydantic-settings==2.7.1

@@ -1,0 +1,30 @@
+# =============================================================================
+# Dashboard dependencies.
+#
+# Separate from the root requirements.txt because the dashboard is optional: someone evaluating
+# the pipeline itself should not have to install Streamlit and its transitive tree to run the
+# tests or build the models.
+#
+# Pinned exactly, not with `>=`. A dashboard that renders differently after a `pip install` on a
+# different day is a dashboard whose screenshots cannot be trusted in a report -- and Streamlit in
+# particular renames widget arguments on a deprecation schedule, so an unpinned install eventually
+# breaks the pages outright.
+# =============================================================================
+
+# Inherited rather than repeated. The dashboard imports trade_sim's Snowflake session, so it needs
+# the connector, pydantic and pandas -- and this file used to name its own versions of all three
+# alongside its own pytest and its own Streamlit. Both files are installed into one virtualenv, so
+# a disagreement between them was settled by install order: `pip install -r requirements.txt -r
+# dashboard/requirements.txt` and `pip install -r dashboard/requirements.txt -r requirements.txt`
+# produced different environments, neither of them an error. One `-r` makes that impossible.
+-r ../requirements.txt
+
+# Newer than the pin this file replaced, and the reason the duplication was worth finding: the
+# pages are written against 1.6's widget arguments, while the root file asked for 1.42. Which one
+# a developer got depended on the order they ran two commands in.
+streamlit==1.62.0
+
+# Charting. Altair rather than Plotly: it ships as a Streamlit dependency already, it is
+# declarative enough that each chart's intent is readable in the source, and its layered API is
+# what makes the dual-axis volume/reject-rate chart possible without hand-managing axes.
+altair==6.2.2

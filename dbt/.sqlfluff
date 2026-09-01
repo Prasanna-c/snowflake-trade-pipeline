@@ -1,0 +1,74 @@
+[sqlfluff]
+dialect = snowflake
+# The dbt templater, which means SQL linting needs a dbt profile and a warehouse connection --
+# so it runs in `make lint-sql` and in the credentialed CI tier, never in the offline checks.
+#
+# The jinja templater would avoid that dependency and was the original choice, but it cannot
+# render this project. The rule catalogue is a macro that hands back a list of dicts through
+# dbt's `return()`, which plain Jinja does not define: the models that loop over it fail
+# outright with "'return' is undefined", and pointing `load_macros_from_path` at the macros
+# directory only moves the failure from an undefined name to an unrecoverable one. Every model
+# that matters here is macro-driven, deliberately, so that the rules have one definition -- and
+# the price of that design is that linting the SQL means compiling the project first.
+templater = dbt
+max_line_length = 120
+# One line, comma separated. This was written as a bracketed, multi-line list, which reads as
+# valid until you notice sqlfluff warning "Tried to denylist unknown rules references:
+# ['(\nRF04', ')']" -- configparser hands over the brackets and newlines as part of the value, so
+# the first and last entries became the literal strings `(\nRF04` and `)`. RF04 was therefore
+# never excluded, and the middle three were, which is why only some of this list appeared to work.
+exclude_rules = RF04, ST06, AM04, ST07
+# RF04: dbt/Snowflake keywords such as "status", "source" are used as column names deliberately.
+# ST06: column ordering in SELECT is chosen for readability, not by type.
+# AM04: models built on ephemeral/incremental refs have wildcard-resolvable schemas at compile time.
+# ST07: USING() is intentionally avoided but join keys are sometimes identical names.
+
+[sqlfluff:indentation]
+indented_joins = false
+indented_using_on = true
+template_blocks_indent = false
+allow_implicit_indents = true
+
+[sqlfluff:templater:dbt]
+# Relative to the directory sqlfluff is invoked from, which every caller makes `dbt/`: the
+# Makefile targets cd there, and so does the CI step.
+project_dir = .
+profiles_dir = .
+profile = trade_pipeline
+# Any target that resolves will do -- linting reads the compiled SQL, not the warehouse it would
+# have run against -- so this names the one every developer has rather than following DBT_TARGET.
+target = dev
+
+[sqlfluff:layout:type:comma]
+line_position = trailing
+
+[sqlfluff:rules:capitalisation.keywords]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.identifiers]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.functions]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.literals]
+capitalisation_policy = lower
+
+[sqlfluff:rules:capitalisation.types]
+extended_capitalisation_policy = lower
+
+[sqlfluff:rules:aliasing.table]
+aliasing = explicit
+
+[sqlfluff:rules:aliasing.column]
+aliasing = explicit
+
+[sqlfluff:rules:ambiguous.column_references]
+group_by_and_order_by_style = explicit
+
+[sqlfluff:rules:convention.count_rows]
+# `count(*)`, which is what all fourteen row counts in the project already say and what
+# Snowflake's own documentation uses. This read `prefer_count_1 = true`, so the rule disagreed
+# with every single site it looked at -- a house style that no file follows is a linter finding
+# about the config, not about the SQL.
+prefer_count_1 = false

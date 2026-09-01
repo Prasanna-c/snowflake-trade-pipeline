@@ -1,0 +1,180 @@
+name: trade_pipeline
+version: 1.0.0
+config-version: 2
+
+profile: trade_pipeline
+
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+clean-targets:
+  - target
+  - dbt_packages
+
+# ---------------------------------------------------------------------------
+# Hooks
+# ---------------------------------------------------------------------------
+# on-run-start creates the audit tables dbt itself writes to. They cannot be
+# models, because they are populated by hooks rather than by a SELECT, and they must
+# exist before the first model runs.
+on-run-start:
+  - "{{ create_audit_infrastructure() }}"
+
+# on-run-end records the outcome of every node in this invocation. This is what
+# MONITORING.VW_PIPELINE_SLA reads to answer "when did dbt last succeed", and what
+# makes a dbt failure visible to Snowflake-side alerting rather than only to Airflow.
+on-run-end:
+  - "{{ log_dbt_results(results) }}"
+
+# ---------------------------------------------------------------------------
+# Model configuration
+# ---------------------------------------------------------------------------
+models:
+  trade_pipeline:
+    # Every model is tagged with its session query_tag before it runs and untagged
+    # after, so ACCOUNT_USAGE.QUERY_HISTORY can attribute cost and latency to a
+    # specific model and dbt invocation. Without this, tuning is guesswork.
+    +pre-hook: "{{ set_model_query_tag() }}"
+    +post-hook: "{{ unset_model_query_tag() }}"
+
+    staging:
+      +schema: staging
+      # Views: staging is renaming and casting only, so materialising it would pay
+      # storage and build time for zero benefit. The cost is pushed into the
+      # downstream model, which is reading the data once anyway.
+      +materialized: view
+      +tags: ["staging"]
+
+    intermediate:
+      +schema: intermediate
+      +materialized: view
+      +tags: ["intermediate"]
+
+    marts:
+      core:
+        +schema: core
+        +materialized: table
+        +tags: ["core", "daily"]
+      reporting:
+        +schema: reporting
+        # Views so dashboards never read stale aggregates. These are small
+        # aggregations over CORE, so recomputing on read is cheaper than the
+        # operational burden of keeping a table fresh.
+        +materialized: view
+        +tags: ["reporting"]
+
+    audit:
+      +schema: audit
+      +materialized: incremental
+      # Compliance evidence is append-only. It is never updated and never deleted,
+      # which is exactly what an auditor wants to be told.
+      +incremental_strategy: append
+      +tags: ["audit", "compliance"]
+
+seeds:
+  trade_pipeline:
+    +schema: core
+    +tags: ["reference"]
+    # Explicit types on every seed. Letting dbt infer them means a CSV where every
+    # is_active value happens to be "true" infers BOOLEAN, and the day someone adds
+    # "TRUE" the seed silently changes type.
+    ref_counterparty:
+      +column_types:
+        counterparty_id: varchar(10)
+        counterparty_name: varchar(200)
+        lei: varchar(20)
+        country_code: varchar(2)
+        credit_rating: varchar(5)
+        is_active: boolean
+    ref_currency:
+      +column_types:
+        currency_code: varchar(3)
+        currency_name: varchar(100)
+        minor_units: number(1, 0)
+        is_deliverable: boolean
+    ref_product:
+      +column_types:
+        product_type: varchar(50)
+        asset_class: varchar(20)
+        requires_maturity: boolean
+        is_physically_settled: boolean
+    ref_book:
+      +column_types:
+        book_id: varchar(30)
+        book_name: varchar(100)
+        desk: varchar(30)
+        legal_entity: varchar(100)
+        notional_limit: number(38, 2)
+    ref_rejection_reason:
+      +column_types:
+        rule_code: varchar(10)
+        rule_name: varchar(100)
+        rule_category: varchar(30)
+        severity: varchar(15)
+        requirement_ref: varchar(10)
+        description: varchar(1000)
+        remediation: varchar(1000)
+
+snapshots:
+  trade_pipeline:
+    +target_schema: snapshots
+    +tags: ["snapshot", "audit"]
+
+tests:
+  trade_pipeline:
+    # Default to warn, then escalate the tests that genuinely must block. A project
+    # where every test is an error trains people to use --exclude; a project where
+    # nothing is an error ships bad data. The distinction is made per test, in the
+    # YAML, with a documented reason.
+    +severity: warn
+    +store_failures: true
+    # Failures land in a dedicated schema so an analyst can query exactly which rows
+    # broke a test, rather than re-deriving it from the test SQL.
+    +schema: dbt_test_failures
+
+# ---------------------------------------------------------------------------
+# Project variables
+# ---------------------------------------------------------------------------
+vars:
+  # Business date used by the temporal rules. Overridable so that a backfill can be
+  # run "as of" a past date, and so unit tests can pin the clock:
+  #   dbt build --vars '{"business_date": "2026-06-01"}'
+  business_date: "{{ run_started_at.strftime('%Y-%m-%d') }}"
+
+  # Trades maturing within this many days appear on the expiring-soon report.
+  expiring_soon_days: 7
+
+  # Full-refresh guard. RAW is the system of record, so a full refresh is always
+  # possible, but it re-adjudicates history and is expensive -- this makes it
+  # deliberate rather than accidental.
+  allow_full_refresh_on_prod: false
+
+  # dbt-utils / dbt-expectations surrogate key behaviour.
+  "dbt_utils:surrogate_key_treat_nulls_as_empty_strings": true
+
+# ---------------------------------------------------------------------------
+# Warehouse routing
+# ---------------------------------------------------------------------------
+# Snowflake lets a single dbt run spread its work across warehouses. Heavy models
+# can be routed to a larger warehouse via `+snowflake_warehouse:` on the model,
+# rather than sizing the whole run for its worst node. See
+# models/intermediate/_intermediate__models.yml for the one place this is used.
+dispatch:
+  - macro_namespace: dbt_utils
+    search_order: ["trade_pipeline", "dbt_utils"]
+
+require-dbt-version: [">=1.9.0", "<2.0.0"]
+
+flags:
+  # Fail rather than silently skip when a --select matches nothing. A typo in a
+  # selector otherwise looks like a successful no-op run, which in CI means a green
+  # build that tested nothing.
+  warn_error_options:
+    error: ["NoNodesForSelectionCriteria"]
+  # Deprecation warnings become errors so upgrades are handled deliberately.
+  require_explicit_package_overrides_for_builtin_materializations: true
+  source_freshness_run_project_hooks: true

@@ -1,0 +1,104 @@
+@startuml 03-adjudication-sequence
+' How one batch is adjudicated, including the version-arbitration ordering.
+' Render: make diagrams
+
+title Adjudication of one batch — why the phase order matters
+
+skinparam backgroundColor #FEFEFE
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam sequenceArrowColor #445566
+skinparam ParticipantBorderColor #445566
+skinparam ParticipantBackgroundColor #FFFFFF
+skinparam NoteBackgroundColor #FFF8E7
+skinparam NoteBorderColor #C8A96A
+
+participant "QUEUE" as Q
+participant "int_trade_event_typed" as T
+participant "reference seeds\ncp / cur / p / bk" as REF
+participant "FIELD rules" as F
+participant "version\narbitration" as ARB
+participant "STATE rules" as S
+participant "FCT_TRADE\n(prior state)" as PRIOR
+database "destinations" as D
+
+Q -> T : raw VARIANT payload
+
+group Step 1 — typing
+  T -> T : try_to_date / try_to_number / ...
+  T -> T : count casts that failed
+  note right of T
+    A try_ cast returns NULL instead of raising,
+    so one bad field cannot abort the batch.
+    But NULL-from-failed-cast then looks identical
+    to never-sent — hence cast_failure_count.
+
+    RJ004 = "you did not send it"
+    RJ008 = "you sent it unreadable"
+    Different teams, different fixes.
+  end note
+end
+
+group Step 2 — FIELD phase (14 rules)
+  T -> F : typed event
+  REF -> F : left joins on counterparty,\ncurrency (x2), product, book
+  F -> F : evaluate **every** rule, no short-circuit
+  note right of F
+    array_construct_compact collects every code
+    that fired. A capture team is told all four
+    of its problems at once, instead of learning
+    one per resubmission.
+  end note
+end
+
+group Step 3 — version arbitration
+  F -> ARB : **field-valid events only**
+  PRIOR -> ARB : stored version, is_cancelled
+  ARB -> ARB : effective_prior_version =\ngreatest(stored, highest accepted earlier in run)
+  ARB -> ARB : intra_run_rank by arrival order
+  note right of ARB #FBEAEA
+    **The critical filter.**
+
+    If a malformed v5 participated here, it would
+    set the mark to 5 — and a valid v3 arriving
+    next would be rejected as stale, on the
+    authority of an event we already threw away.
+
+    One bad message would poison the trade's
+    entire subsequent history, and every
+    resulting rejection would look correct.
+  end note
+end
+
+group Step 4 — STATE phase (3 rules)
+  ARB -> S : arbitration columns
+  S -> S : RJ001 stale version\nRJ009 superseded in run\nRJ010 amend after cancel
+end
+
+S -> D : verdict + violated_rule_codes
+
+alt no REJECT-severity code fired
+  D -> D : **ACCEPTED**\n-> FCT_TRADE + FCT_TRADE_VERSION
+  note right of D
+    WARN codes (RJ018 limit breach,
+    RJ019 duplicate UTI) are recorded
+    against an *accepted* trade.
+    Rejecting a limit breach would just
+    push it into three smaller tickets.
+  end note
+else RJ009 only
+  D -> D : **SUPERSEDED**\n-> FCT_TRADE_REJECTED
+  note right of D
+    Excluded from the reject-rate gate:
+    it is R2 working correctly, and counting
+    it would fire the gate on healthy
+    amendment traffic.
+  end note
+else any REJECT code
+  D -> D : **REJECTED**\n-> FCT_TRADE_REJECTED **+ raw_payload**
+end
+
+D -> D : every rule hit -> TRADE_RULE_RESULT
+
+@enduml

@@ -1,0 +1,455 @@
+# =============================================================================
+# UNIT TESTS FOR THE RULE ENGINE.
+#
+# These are the tests that prove each business rule, and they are the highest-value
+# tests in the project. The distinction from the data tests in
+# `_intermediate__models.yml` is worth being precise about:
+#
+#   Data tests ask  "is the data in the warehouse right now consistent?"
+#                   They need data. They pass vacuously on an empty table, and they
+#                   cannot tell you WHY something is wrong.
+#
+#   Unit tests ask  "given exactly this input, does the logic produce exactly this
+#                   verdict?" They need no warehouse data at all, they run in seconds,
+#                   and they fail with a precise diff.
+#
+# The practical consequence: a change to the rule engine that breaks business rule 1 is
+# caught in CI on a pull request, before any data has been processed, rather than being
+# discovered when a stale amendment overwrites a good trade in production.
+#
+# CONVENTIONS USED BELOW
+#
+#   * Unspecified columns default to null, so each fixture lists only the columns the
+#     assertion depends on. This keeps a test readable as a statement about one rule.
+#   * `overrides.macros.is_incremental: false` runs the model's full-refresh branch. That
+#     means prior state comes from within the fixture rather than from `{{ this }}`,
+#     which dbt cannot mock. Rule 1 is therefore tested through the within-run high-water
+#     mark -- the window-function path, which is the harder and more error-prone half of
+#     the logic anyway. The across-run path is covered end-to-end by
+#     `trade-sim reconcile`.
+#   * `business_date` is pinned per test so the temporal rules do not change verdict as
+#     the calendar moves. A test that starts failing in three weeks because a fixture
+#     date drifted into the past is a test nobody trusts.
+# =============================================================================
+
+unit_tests:
+
+  # =========================================================================
+  # BUSINESS RULE 1 -- reject a version lower than the one already held.
+  # =========================================================================
+  - name: rule1_rejects_version_below_high_water_mark
+    model: int_trade_event_adjudicated
+    description: >
+      v5 arrives, then v3 arrives for the same trade. v5 is accepted and sets the mark;
+      v3 must be rejected with RJ001. This is the case that a naive "compare to the
+      previous row" implementation gets wrong.
+    overrides:
+      macros:
+        is_incremental: false
+      vars:
+        business_date: "2026-06-15"
+    given:
+      - input: ref('int_trade_event_typed')
+        rows:
+          - {event_sk: 1, batch_seq: 1, trade_id: "TRD-000000001", trade_version: 5, action: "AMEND", buy_sell: "BUY", notional_amount: 1000000, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_FORWARD", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-12-01", effective_event_ts: "2026-06-15 10:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{"trade_id":"TRD-000000001"}'}
+          - {event_sk: 2, batch_seq: 2, trade_id: "TRD-000000001", trade_version: 3, action: "AMEND", buy_sell: "BUY", notional_amount: 1000000, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_FORWARD", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-12-01", effective_event_ts: "2026-06-15 11:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{"trade_id":"TRD-000000001"}'}
+      - input: ref('ref_counterparty')
+        rows:
+          - {counterparty_id: "CP0001", counterparty_name: "Aldgate Capital Partners LLP", is_active: true}
+      - input: ref('ref_book')
+        rows:
+          - {book_id: "BK-FX-LDN-01", book_name: "FX Cash London", notional_limit: 250000000}
+      - input: ref('ref_product')
+        rows:
+          - {product_type: "FX_FORWARD", asset_class: "FX", is_physically_settled: true, requires_maturity: true}
+      - input: ref('ref_currency')
+        rows:
+          - {currency_code: "USD", is_deliverable: true, minor_units: 2}
+    expect:
+      rows:
+        # version_action is NEW, not AMEND: it describes what the event did to stored
+        # state, and with no prior version this v5 creates the record. The AMEND in the
+        # input is the source system's action field, which is a different question.
+        - {event_sk: 1, verdict: "ACCEPTED", version_action: "NEW", effective_prior_version: 0}
+        - {event_sk: 2, verdict: "REJECTED", version_action: null, effective_prior_version: 5}
+
+  - name: rule1_accepts_ascending_versions_in_one_batch
+    model: int_trade_event_adjudicated
+    description: >
+      v1, v2 and v3 arriving in one batch must ALL be accepted. A high-water mark computed
+      over the whole partition instead of only preceding rows would reject v1 and v2
+      against v3 -- a bug that only appears when several versions land together, which is
+      exactly what happens during a catch-up after an outage.
+    overrides:
+      macros:
+        is_incremental: false
+      vars:
+        business_date: "2026-06-15"
+    given:
+      - input: ref('int_trade_event_typed')
+        rows:
+          - {event_sk: 1, batch_seq: 1, trade_id: "TRD-000000002", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: 500000, notional_currency: "EUR", settlement_currency: "EUR", product_type: "IRS", counterparty_id: "CP0001", book_id: "BK-RT-FRA-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2031-06-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          - {event_sk: 2, batch_seq: 1, trade_id: "TRD-000000002", trade_version: 2, action: "AMEND", buy_sell: "BUY", notional_amount: 600000, notional_currency: "EUR", settlement_currency: "EUR", product_type: "IRS", counterparty_id: "CP0001", book_id: "BK-RT-FRA-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2031-06-01", effective_event_ts: "2026-06-15 10:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          - {event_sk: 3, batch_seq: 1, trade_id: "TRD-000000002", trade_version: 3, action: "AMEND", buy_sell: "BUY", notional_amount: 700000, notional_currency: "EUR", settlement_currency: "EUR", product_type: "IRS", counterparty_id: "CP0001", book_id: "BK-RT-FRA-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2031-06-01", effective_event_ts: "2026-06-15 11:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+      - input: ref('ref_counterparty')
+        rows:
+          - {counterparty_id: "CP0001", counterparty_name: "Aldgate", is_active: true}
+      - input: ref('ref_book')
+        rows:
+          - {book_id: "BK-RT-FRA-01", book_name: "Rates Flow Frankfurt", notional_limit: 500000000}
+      - input: ref('ref_product')
+        rows:
+          - {product_type: "IRS", asset_class: "RATES", is_physically_settled: false, requires_maturity: true}
+      - input: ref('ref_currency')
+        rows:
+          - {currency_code: "EUR", is_deliverable: true, minor_units: 2}
+    expect:
+      rows:
+        - {event_sk: 1, verdict: "ACCEPTED", version_action: "NEW", effective_prior_version: 0}
+        - {event_sk: 2, verdict: "ACCEPTED", version_action: "AMEND", effective_prior_version: 1}
+        - {event_sk: 3, verdict: "ACCEPTED", version_action: "AMEND", effective_prior_version: 2}
+
+  - name: rule1_ignores_invalid_events_when_setting_the_mark
+    model: int_trade_event_adjudicated
+    description: >
+      THE SUBTLEST CASE IN THE PROJECT. A v9 arrives with an invalid currency and is
+      rejected. A valid v4 then arrives. v4 must be ACCEPTED -- the discarded v9 must not
+      be allowed to set the high-water mark, because we never accepted it.
+
+      If the FIELD and STATE rule phases were evaluated together, v4 would be wrongly
+      rejected as stale on the authority of an event we threw away. This test is the
+      reason the two phases exist.
+    overrides:
+      macros:
+        is_incremental: false
+      vars:
+        business_date: "2026-06-15"
+    given:
+      - input: ref('int_trade_event_typed')
+        rows:
+          - {event_sk: 1, batch_seq: 1, trade_id: "TRD-000000003", trade_version: 9, action: "AMEND", buy_sell: "BUY", notional_amount: 100000, notional_currency: "XXX", settlement_currency: "XXX", product_type: "FX_SPOT", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-06-05", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          - {event_sk: 2, batch_seq: 2, trade_id: "TRD-000000003", trade_version: 4, action: "AMEND", buy_sell: "BUY", notional_amount: 100000, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_SPOT", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-06-20", effective_event_ts: "2026-06-15 10:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+      - input: ref('ref_counterparty')
+        rows:
+          - {counterparty_id: "CP0001", counterparty_name: "Aldgate", is_active: true}
+      - input: ref('ref_book')
+        rows:
+          - {book_id: "BK-FX-LDN-01", book_name: "FX Cash London", notional_limit: 250000000}
+      - input: ref('ref_product')
+        rows:
+          - {product_type: "FX_SPOT", asset_class: "FX", is_physically_settled: true, requires_maturity: true}
+      - input: ref('ref_currency')
+        rows:
+          - {currency_code: "USD", is_deliverable: true, minor_units: 2}
+    expect:
+      rows:
+        - {event_sk: 1, verdict: "REJECTED", version_action: null, effective_prior_version: 0}
+        # effective_prior_version stays 0 -- which is the whole point: the rejected v9 did
+        # not set the mark. version_action is therefore NEW rather than AMEND.
+        - {event_sk: 2, verdict: "ACCEPTED", version_action: "NEW", effective_prior_version: 0}
+
+  # =========================================================================
+  # BUSINESS RULE 2 -- a same-version resend replaces the stored trade.
+  # =========================================================================
+  - name: rule2_same_version_resend_supersedes_the_earlier_arrival
+    model: int_trade_event_adjudicated
+    description: >
+      Two events at v2 of the same trade with different economics. The later one by
+      business time wins and is ACCEPTED; the earlier is recorded as SUPERSEDED with
+      RJ009 rather than being deleted.
+
+      SUPERSEDED is deliberately not REJECTED: this is a rule working correctly, and
+      counting it as a data quality failure would inflate the reject rate that the
+      alerting thresholds are calibrated against.
+
+      The survivor's version_action is NEW, not REPLACE. Nothing was stored for this
+      trade, and the superseded sibling never reaches the golden record, so there is
+      nothing to replace. REPLACE requires a version already persisted by an earlier
+      run, which this fixture cannot set up because it overrides is_incremental to
+      false -- see the note at the top of this file.
+    overrides:
+      macros:
+        is_incremental: false
+      vars:
+        business_date: "2026-06-15"
+    given:
+      - input: ref('int_trade_event_typed')
+        rows:
+          - {event_sk: 1, batch_seq: 1, trade_id: "TRD-000000004", trade_version: 2, action: "AMEND", buy_sell: "BUY", notional_amount: 1000000, notional_currency: "GBP", settlement_currency: "GBP", product_type: "FX_FORWARD", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-12-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          - {event_sk: 2, batch_seq: 1, trade_id: "TRD-000000004", trade_version: 2, action: "AMEND", buy_sell: "BUY", notional_amount: 2000000, notional_currency: "GBP", settlement_currency: "GBP", product_type: "FX_FORWARD", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-12-01", effective_event_ts: "2026-06-15 14:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+      - input: ref('ref_counterparty')
+        rows:
+          - {counterparty_id: "CP0001", counterparty_name: "Aldgate", is_active: true}
+      - input: ref('ref_book')
+        rows:
+          - {book_id: "BK-FX-LDN-01", book_name: "FX Cash London", notional_limit: 250000000}
+      - input: ref('ref_product')
+        rows:
+          - {product_type: "FX_FORWARD", asset_class: "FX", is_physically_settled: true, requires_maturity: true}
+      - input: ref('ref_currency')
+        rows:
+          - {currency_code: "GBP", is_deliverable: true, minor_units: 2}
+    expect:
+      rows:
+        # The later arrival wins: rank 1, accepted, and the notional it carried is the one
+        # that survives into the golden record.
+        - {event_sk: 2, verdict: "ACCEPTED", version_action: "NEW", intra_run_rank: 1, notional_amount: 2000000}
+        - {event_sk: 1, verdict: "SUPERSEDED", version_action: null, intra_run_rank: 2, notional_amount: 1000000}
+
+  - name: rule2_a_malformed_resend_does_not_supersede_a_valid_arrival
+    model: int_trade_event_adjudicated
+    description: >
+      A valid v1 booking, then a second v1 arrival stamped later whose direction is
+      garbage. The malformed event must be REJECTED on its own merits and must leave the
+      good event ACCEPTED -- it is not a candidate for the version at all.
+
+      This is the case that matters most in the whole file. Ranking every arrival together
+      and only afterwards discarding the invalid ones means a corrupt duplicate silently
+      knocks out a real trade: the good event becomes SUPERSEDED, disappears from the golden
+      record, and every test still passes because supersession is a rule working correctly.
+      A feed that resends with a mangled field would quietly delete good trades.
+
+      Both events are rank 1 here, which is not a contradiction: they are ranked in separate
+      partitions, because a rejected arrival competes with nothing.
+    overrides:
+      macros:
+        is_incremental: false
+      vars:
+        business_date: "2026-06-15"
+    given:
+      - input: ref('int_trade_event_typed')
+        rows:
+          - {event_sk: 1, batch_seq: 1, trade_id: "TRD-000000009", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: 1000000, notional_currency: "GBP", settlement_currency: "GBP", product_type: "FX_FORWARD", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-12-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          - {event_sk: 2, batch_seq: 1, trade_id: "TRD-000000009", trade_version: 1, action: "NEW", buy_sell: "SIDEWAYS", notional_amount: 1000000, notional_currency: "GBP", settlement_currency: "GBP", product_type: "FX_FORWARD", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-12-01", effective_event_ts: "2026-06-15 14:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+      - input: ref('ref_counterparty')
+        rows:
+          - {counterparty_id: "CP0001", counterparty_name: "Aldgate", is_active: true}
+      - input: ref('ref_book')
+        rows:
+          - {book_id: "BK-FX-LDN-01", book_name: "FX Cash London", notional_limit: 250000000}
+      - input: ref('ref_product')
+        rows:
+          - {product_type: "FX_FORWARD", asset_class: "FX", is_physically_settled: true, requires_maturity: true}
+      - input: ref('ref_currency')
+        rows:
+          - {currency_code: "GBP", is_deliverable: true, minor_units: 2}
+    expect:
+      rows:
+        - {event_sk: 1, verdict: "ACCEPTED", version_action: "NEW", intra_run_rank: 1}
+        - {event_sk: 2, verdict: "REJECTED", version_action: null, intra_run_rank: 1}
+
+  # =========================================================================
+  # BUSINESS RULE 3 -- reject a trade whose maturity date has already passed.
+  # =========================================================================
+  - name: rule3_rejects_maturity_in_the_past
+    model: int_trade_event_adjudicated
+    description: >
+      A new trade maturing before the business date is rejected with RJ003. A trade
+      maturing after it is accepted. A CANCEL of an already-matured trade is accepted --
+      cancellation must remain possible after maturity, or a wrongly-booked trade could
+      never be withdrawn.
+    overrides:
+      macros:
+        is_incremental: false
+      vars:
+        business_date: "2026-06-15"
+    given:
+      - input: ref('int_trade_event_typed')
+        rows:
+          # Matured 6 months ago -> RJ003.
+          - {event_sk: 1, batch_seq: 1, trade_id: "TRD-000000005", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: 100000, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_FORWARD", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2025-12-01", settlement_date: "2025-12-03", maturity_date: "2025-12-15", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          # Matures in the future -> accepted.
+          - {event_sk: 2, batch_seq: 1, trade_id: "TRD-000000006", trade_version: 1, action: "NEW", buy_sell: "SELL", notional_amount: 100000, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_FORWARD", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2027-06-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          # Cancellation of a matured trade -> accepted, RJ003 exempt.
+          - {event_sk: 3, batch_seq: 1, trade_id: "TRD-000000007", trade_version: 2, action: "CANCEL", buy_sell: "BUY", notional_amount: 100000, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_FORWARD", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2025-12-01", settlement_date: "2025-12-03", maturity_date: "2025-12-20", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          # Maturity before trade date -> both RJ002 and RJ003.
+          - {event_sk: 4, batch_seq: 1, trade_id: "TRD-000000008", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: 100000, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_FORWARD", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-01-10", settlement_date: "2026-01-12", maturity_date: "2026-01-05", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+      - input: ref('ref_counterparty')
+        rows:
+          - {counterparty_id: "CP0001", counterparty_name: "Aldgate", is_active: true}
+      - input: ref('ref_book')
+        rows:
+          - {book_id: "BK-FX-LDN-01", book_name: "FX Cash London", notional_limit: 250000000}
+      - input: ref('ref_product')
+        rows:
+          - {product_type: "FX_FORWARD", asset_class: "FX", is_physically_settled: true, requires_maturity: true}
+      - input: ref('ref_currency')
+        rows:
+          - {currency_code: "USD", is_deliverable: true, minor_units: 2}
+    expect:
+      rows:
+        - {event_sk: 1, verdict: "REJECTED"}
+        - {event_sk: 2, verdict: "ACCEPTED"}
+        - {event_sk: 3, verdict: "ACCEPTED"}
+        - {event_sk: 4, verdict: "REJECTED"}
+
+  # =========================================================================
+  # FIELD-LEVEL VALIDATION
+  # =========================================================================
+  - name: field_rules_reject_reference_and_economic_defects
+    model: int_trade_event_adjudicated
+    description: >
+      One event per defect class, confirming each is refused: unknown counterparty (RJ005),
+      inactive counterparty (RJ016), unknown book (RJ011), unsupported product (RJ013),
+      negative notional (RJ007), invalid direction (RJ015), and a non-deliverable currency
+      on a physically-settled product (RJ017).
+    overrides:
+      macros:
+        is_incremental: false
+      vars:
+        business_date: "2026-06-15"
+    given:
+      - input: ref('int_trade_event_typed')
+        rows:
+          - {event_sk: 1, batch_seq: 1, trade_id: "TRD-000000010", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: 100000, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_SPOT", counterparty_id: "CP9999", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-07-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          - {event_sk: 2, batch_seq: 1, trade_id: "TRD-000000011", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: 100000, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_SPOT", counterparty_id: "CP0021", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-07-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          - {event_sk: 3, batch_seq: 1, trade_id: "TRD-000000012", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: 100000, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_SPOT", counterparty_id: "CP0001", book_id: "BK-XX-XXX-99", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-07-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          - {event_sk: 4, batch_seq: 1, trade_id: "TRD-000000013", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: 100000, notional_currency: "USD", settlement_currency: "USD", product_type: "CRYPTO_PERP", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-07-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          - {event_sk: 5, batch_seq: 1, trade_id: "TRD-000000014", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: -100000, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_SPOT", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-07-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          - {event_sk: 6, batch_seq: 1, trade_id: "TRD-000000015", trade_version: 1, action: "NEW", buy_sell: "LONG", notional_amount: 100000, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_SPOT", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-07-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          - {event_sk: 7, batch_seq: 1, trade_id: "TRD-000000016", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: 100000, notional_currency: "KRW", settlement_currency: "KRW", product_type: "FX_FORWARD", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-07-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          # A clean control row. Without one, a test that rejects everything -- including
+          # because of a bug that rejects unconditionally -- would still pass.
+          - {event_sk: 8, batch_seq: 1, trade_id: "TRD-000000017", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: 100000, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_SPOT", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-07-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+      - input: ref('ref_counterparty')
+        rows:
+          - {counterparty_id: "CP0001", counterparty_name: "Aldgate", is_active: true}
+          - {counterparty_id: "CP0021", counterparty_name: "Umbria Legacy Holdings Srl", is_active: false}
+      - input: ref('ref_book')
+        rows:
+          - {book_id: "BK-FX-LDN-01", book_name: "FX Cash London", notional_limit: 250000000}
+      - input: ref('ref_product')
+        rows:
+          - {product_type: "FX_SPOT", asset_class: "FX", is_physically_settled: true, requires_maturity: true}
+          - {product_type: "FX_FORWARD", asset_class: "FX", is_physically_settled: true, requires_maturity: true}
+      - input: ref('ref_currency')
+        rows:
+          - {currency_code: "USD", is_deliverable: true, minor_units: 2}
+          - {currency_code: "KRW", is_deliverable: false, minor_units: 0}
+    expect:
+      rows:
+        - {event_sk: 1, verdict: "REJECTED"}
+        - {event_sk: 2, verdict: "REJECTED"}
+        - {event_sk: 3, verdict: "REJECTED"}
+        - {event_sk: 4, verdict: "REJECTED"}
+        - {event_sk: 5, verdict: "REJECTED"}
+        - {event_sk: 6, verdict: "REJECTED"}
+        - {event_sk: 7, verdict: "REJECTED"}
+        - {event_sk: 8, verdict: "ACCEPTED"}
+
+  - name: field_rules_distinguish_malformed_from_missing
+    model: int_trade_event_adjudicated
+    description: >
+      The distinction that makes rejection reports useful. A field that was SENT but could
+      not be cast is RJ008 (malformed); a field that was NOT SENT is RJ004 (missing).
+      Telling an upstream team the wrong one sends them after the wrong bug.
+    overrides:
+      macros:
+        is_incremental: false
+      vars:
+        business_date: "2026-06-15"
+    given:
+      - input: ref('int_trade_event_typed')
+        rows:
+          # Sent "1,234.00", which failed to cast: notional is null AND cast_failure_count > 0.
+          - {event_sk: 1, batch_seq: 1, trade_id: "TRD-000000020", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: null, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_SPOT", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-07-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 1, uti_distinct_trade_count: 1, raw_payload: '{}'}
+          # Simply absent: notional is null and cast_failure_count is 0.
+          - {event_sk: 2, batch_seq: 1, trade_id: "TRD-000000021", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: null, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_SPOT", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-07-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+      - input: ref('ref_counterparty')
+        rows:
+          - {counterparty_id: "CP0001", counterparty_name: "Aldgate", is_active: true}
+      - input: ref('ref_book')
+        rows:
+          - {book_id: "BK-FX-LDN-01", book_name: "FX Cash London", notional_limit: 250000000}
+      - input: ref('ref_product')
+        rows:
+          - {product_type: "FX_SPOT", asset_class: "FX", is_physically_settled: true, requires_maturity: true}
+      - input: ref('ref_currency')
+        rows:
+          - {currency_code: "USD", is_deliverable: true, minor_units: 2}
+    expect:
+      rows:
+        # Both rejected, but with different codes. The codes are asserted rather than just
+        # the verdict, so a regression that collapses the two cases into one code fails.
+        #
+        # Asserted through violated_rule_codes_csv rather than the array itself: a unit
+        # test fixture cannot express an ARRAY on Snowflake. See the note on that column
+        # in the model.
+        - {event_sk: 1, verdict: "REJECTED", violated_rule_codes_csv: "RJ004,RJ008"}
+        - {event_sk: 2, verdict: "REJECTED", violated_rule_codes_csv: "RJ004"}
+
+  # =========================================================================
+  # WARN SEVERITY
+  # =========================================================================
+  - name: warn_rules_do_not_block_acceptance
+    model: int_trade_event_adjudicated
+    description: >
+      A trade over its book's notional limit is ACCEPTED and flagged with RJ018, not
+      rejected. Rejecting it would hide the breach -- the desk would resubmit as several
+      smaller tickets and risk would never see the position.
+    overrides:
+      macros:
+        is_incremental: false
+      vars:
+        business_date: "2026-06-15"
+    given:
+      - input: ref('int_trade_event_typed')
+        rows:
+          - {event_sk: 1, batch_seq: 1, trade_id: "TRD-000000030", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: 500000000, notional_currency: "USD", settlement_currency: "USD", product_type: "FX_SPOT", counterparty_id: "CP0001", book_id: "BK-FX-LDN-01", trade_date: "2026-06-01", settlement_date: "2026-06-03", maturity_date: "2026-07-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+      - input: ref('ref_counterparty')
+        rows:
+          - {counterparty_id: "CP0001", counterparty_name: "Aldgate", is_active: true}
+      - input: ref('ref_book')
+        rows:
+          - {book_id: "BK-FX-LDN-01", book_name: "FX Cash London", notional_limit: 250000000}
+      - input: ref('ref_product')
+        rows:
+          - {product_type: "FX_SPOT", asset_class: "FX", is_physically_settled: true, requires_maturity: true}
+      - input: ref('ref_currency')
+        rows:
+          - {currency_code: "USD", is_deliverable: true, minor_units: 2}
+    expect:
+      rows:
+        # RJ018 appears in both by design: violated_rule_codes_csv is every code that
+        # fired, warning_rule_codes_csv is that list intersected with the WARN severities.
+        # Asserting both is what proves the severity split, rather than merely that
+        # something fired.
+        - {event_sk: 1, verdict: "ACCEPTED", version_action: "NEW", violated_rule_codes_csv: "RJ018", warning_rule_codes_csv: "RJ018"}
+
+  # =========================================================================
+  # MULTIPLE VIOLATIONS
+  # =========================================================================
+  - name: all_violated_rules_are_reported_not_just_the_first
+    model: int_trade_event_adjudicated
+    description: >
+      An event with four independent defects must report all four codes. Short-circuiting
+      on the first failure would make a trade capture team resubmit four times, learning
+      about one new defect each time.
+    overrides:
+      macros:
+        is_incremental: false
+      vars:
+        business_date: "2026-06-15"
+    given:
+      - input: ref('int_trade_event_typed')
+        rows:
+          # Unknown counterparty (RJ005), invalid currency (RJ006), zero notional (RJ007),
+          # future trade date (RJ014).
+          - {event_sk: 1, batch_seq: 1, trade_id: "TRD-000000040", trade_version: 1, action: "NEW", buy_sell: "BUY", notional_amount: 0, notional_currency: "XXX", settlement_currency: "XXX", product_type: "FX_SPOT", counterparty_id: "CP9999", book_id: "BK-FX-LDN-01", trade_date: "2026-12-31", settlement_date: "2027-01-04", maturity_date: "2027-06-01", effective_event_ts: "2026-06-15 09:00:00", cast_failure_count: 0, uti_distinct_trade_count: 1, raw_payload: '{}'}
+      - input: ref('ref_counterparty')
+        rows:
+          - {counterparty_id: "CP0001", counterparty_name: "Aldgate", is_active: true}
+      - input: ref('ref_book')
+        rows:
+          - {book_id: "BK-FX-LDN-01", book_name: "FX Cash London", notional_limit: 250000000}
+      - input: ref('ref_product')
+        rows:
+          - {product_type: "FX_SPOT", asset_class: "FX", is_physically_settled: true, requires_maturity: true}
+      - input: ref('ref_currency')
+        rows:
+          - {currency_code: "USD", is_deliverable: true, minor_units: 2}
+    expect:
+      rows:
+        # The codes appear in rule-definition order, which is the order
+        # array_construct_compact() emits them in.
+        - {event_sk: 1, verdict: "REJECTED", violated_rule_count: 4, violated_rule_codes_csv: "RJ005,RJ006,RJ007,RJ014"}

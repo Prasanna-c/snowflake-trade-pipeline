@@ -1,0 +1,93 @@
+@startuml 02-data-flow
+' End-to-end data flow with every destination an event can reach.
+' Render: make diagrams
+
+title Data Flow — every event reaches exactly one destination
+
+skinparam backgroundColor #FEFEFE
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam roundCorner 6
+skinparam ArrowColor #445566
+skinparam ArrowFontSize 11
+skinparam rectangle {
+  BorderColor #445566
+  BackgroundColor #FFFFFF
+}
+
+rectangle "<b>NDJSON files</b> + manifest\none line per event; the manifest\nrecords the verdict each event <i>must</i> receive" as FILES #FFF8E7
+
+rectangle "<b>@RAW.TRADE_LANDING</b>\ninternal stage" as STAGE #EAFBEF
+
+rectangle "<b>RAW.TRADE_EVENT</b>\nVARIANT payload, insert-only\n14-day Time Travel" as RAW #EAFBEF
+rectangle "<b>RAW.COPY_ERROR</b>\nraw line retained\n<i>never reached the rule engine</i>" as CERR #FBEAEA
+
+rectangle "<b>RAW.TRADE_EVENT_STREAM</b>\nAPPEND_ONLY, transactional offset" as STREAM #EAFBEF
+rectangle "<b>RAW.TRADE_EVENT_QUEUE</b>\n<b>the contract dbt reads</b>" as QUEUE #D9F2E3
+
+rectangle "<b>stg_trade_event</b>\nview — rename only, no logic" as STG #EAF3FB
+rectangle "<b>int_trade_event_typed</b>\ntry_to_* casts\n+ cast_failure_count" as TYPED #EAF3FB
+
+rectangle "<b>int_trade_event_adjudicated</b>\n1. FIELD rules\n2. version arbitration <i>(field-valid only)</i>\n3. STATE rules\n4. verdict" as ADJ #C9DEF5
+
+rectangle "<b>CORE.FCT_TRADE</b>\ngolden record\ncurrent version + lifecycle" as FCT #D9F2E3
+rectangle "<b>CORE.FCT_TRADE_VERSION</b>\nversion ledger\nevery accepted version" as FCTV #D9F2E3
+rectangle "<b>AUDIT.FCT_TRADE_REJECTED</b>\n+ raw_payload as it arrived" as REJ #FBEAEA
+rectangle "<b>AUDIT.TRADE_RULE_RESULT</b>\none row per (event, rule)\nincluding WARN on accepted trades" as RR #FBF3EA
+
+rectangle "<b>SNAPSHOTS.SNP_TRADE</b>\nSCD2 — captures transitions\nthat have <i>no event</i> (expiry)" as SNAP #F3EAFB
+rectangle "<b>REPORTING.*</b>\naggregates +\nDQ scorecard" as REP #F3EAFB
+
+FILES --> STAGE : PUT
+STAGE --> RAW : COPY INTO\nON_ERROR = CONTINUE
+STAGE --> CERR : line could not be parsed
+RAW --> STREAM : stream captures the delta
+STREAM --> QUEUE : SP_DRAIN — <b>one transaction</b>\ninsert + batch record + offset advance
+QUEUE --> STG
+STG --> TYPED
+TYPED --> ADJ
+
+ADJ --> FCT : ACCEPTED
+ADJ --> FCTV : ACCEPTED
+ADJ --> REJ : REJECTED\nor SUPERSEDED
+ADJ --> RR : every rule that fired
+
+FCT --> SNAP
+FCT --> REP
+REJ --> REP
+
+note right of ADJ
+  <b>Why FIELD precedes STATE</b>
+
+  Arbitration uses only field-valid events.
+  A malformed v5 must not set the high-water
+  mark, or a valid v3 would then be rejected
+  as stale on the authority of an event we
+  already refused.
+end note
+
+note bottom of REJ
+  <b>assert_no_event_is_silently_dropped</b>
+  Every event entering the queue must reach
+  exactly one of FCT_TRADE, FCT_TRADE_REJECTED
+  (rejected), or FCT_TRADE_REJECTED (superseded).
+  A violation is silent data loss — P1.
+end note
+
+note left of QUEUE
+  The ingestion mechanism can be replaced
+  (Snowpipe Streaming, Kafka connector,
+  external table) without any dbt model
+  changing. This is what makes scaling
+  to 10,000x tractable.
+end note
+
+note right of CERR
+  ON_ERROR = CONTINUE means one bad line
+  cannot block a file — and is exactly what
+  makes loss invisible. Hence COPY_ERROR
+  and vw_copy_history's PARTIAL_LOAD.
+end note
+
+@enduml

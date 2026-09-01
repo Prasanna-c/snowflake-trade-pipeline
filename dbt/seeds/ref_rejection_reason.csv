@@ -1,0 +1,20 @@
+rule_code,rule_name,rule_category,severity,requirement_ref,description,remediation
+RJ001,Stale version,VERSION,REJECT,R1,Incoming trade version is lower than the version already stored for this trade.,Upstream replayed an old message. Confirm the current version with the source system; no action needed if the stored version is correct.
+RJ002,Maturity before trade date,TEMPORAL,REJECT,OWN,"Maturity date is earlier than the trade date, which is economically impossible.",Booking error. Correct the maturity date and resubmit with an incremented version.
+RJ003,Maturity in the past,TEMPORAL,REJECT,R3,"Maturity date is earlier than today, so the trade cannot be booked as live.",Either the trade is a late back-booking (submit through the historical load path) or the maturity date is wrong.
+RJ004,Missing mandatory field,COMPLETENESS,REJECT,OWN,One or more mandatory fields are null or absent from the payload.,Fix the upstream mapping. The rule detail column names the missing field.
+RJ005,Unknown counterparty,REFERENCE,REJECT,OWN,counterparty_id does not exist in the counterparty reference data.,"Either the counterparty is genuinely new (onboard it, then replay) or the identifier is malformed."
+RJ006,Invalid currency,REFERENCE,REJECT,OWN,notional_currency is not a supported ISO 4217 code.,Correct the currency code upstream. Watch for lower-case codes and two-letter country codes.
+RJ007,Non-positive notional,ECONOMIC,REJECT,OWN,"Notional amount is zero, negative or absent.","Direction is carried by buy_sell, never by the sign of the notional. Fix the upstream mapping."
+RJ008,Malformed payload,STRUCTURAL,REJECT,OWN,"The payload could not be interpreted as a trade: unparseable JSON, or a field that failed type coercion.",Inspect the raw payload in AUDIT.FCT_TRADE_REJECTED. Usually an encoding or serialisation defect upstream.
+RJ009,Superseded within run,VERSION,SUPERSEDE,R2,"A later arrival carried the same trade_id and version, so this event was replaced.",Informational. This is business rule 2 (replace same version) operating correctly; no action required.
+RJ010,Amendment after cancellation,LIFECYCLE,REJECT,OWN,An amendment arrived for a trade that has already been cancelled.,"Cancellation is terminal. To reinstate, book a new trade with a new trade_id."
+RJ011,Unknown book,REFERENCE,REJECT,OWN,book_id does not exist in the book reference data.,Onboard the book or correct the identifier. Unmapped books break P&L attribution.
+RJ012,Settlement before trade date,TEMPORAL,REJECT,OWN,Settlement date precedes the trade date.,"Booking error, commonly a timezone or date-format defect upstream."
+RJ013,Unsupported product,REFERENCE,REJECT,OWN,product_type is not a product this platform is authorised to process.,"Route to the correct platform, or extend the supported product list if in scope."
+RJ014,Trade date in the future,TEMPORAL,REJECT,OWN,Trade date is later than today.,Almost always a timezone bug. Verify the upstream system is emitting UTC.
+RJ015,Invalid direction,ECONOMIC,REJECT,OWN,buy_sell is not one of BUY or SELL.,Fix the upstream enumeration mapping.
+RJ016,Inactive counterparty,REFERENCE,REJECT,OWN,"The counterparty exists but is flagged inactive (defaulted, in administration or offboarded).",Trading with an inactive counterparty requires credit approval. Escalate rather than resubmitting.
+RJ017,Non-deliverable currency on physical settlement,ECONOMIC,REJECT,OWN,A physically-settled product was booked in a non-deliverable currency.,"Rebook as an NDF, or correct the settlement currency to a deliverable one."
+RJ018,Desk notional limit breached,LIMIT,WARN,OWN,Notional exceeds the book's configured limit.,Warning only -- the trade is accepted and flagged. Risk reviews breaches daily.
+RJ019,Duplicate trade identifier,STRUCTURAL,WARN,OWN,"The same UTI was seen on a different trade_id, suggesting a double booking.",Warning only. Operations reconciles UTIs against the trade repository.

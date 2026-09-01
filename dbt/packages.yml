@@ -1,0 +1,24 @@
+packages:
+  # Surrogate keys, the date spine, and the generic tests this project relies on
+  # (expression_is_true, cardinality_equality, not_accepted_values). Pinned to a minor
+  # range rather than "latest": a package that changes surrogate-key hashing between
+  # runs would silently rewrite every key in the warehouse.
+  - package: dbt-labs/dbt_utils
+    version: [">=1.3.0", "<2.0.0"]
+
+  # Richer assertions than dbt's built-ins: distributional checks on notional, row-count
+  # comparisons between layers, and recency tests. Used sparingly -- see
+  # models/marts/core/_core__models.yml.
+  - package: calogica/dbt_expectations
+    version: [">=0.10.4", "<0.11.0"]
+
+# Deliberately NOT included: brooklyn-data/dbt_artifacts.
+#
+# It persists dbt's run artifacts into Snowflake, which overlaps almost entirely with
+# AUDIT.DBT_RUN_RESULT (see macros/utils/audit_infrastructure.sql). Our hook-based table is
+# ~60 lines we own and can change, whereas the package adds a dozen models and its own
+# sources to the project for the one extra capability we would actually use -- retaining the
+# historical shape of the DAG.
+#
+# Worth revisiting if DAG-level regression analysis becomes a real need. Until then it is
+# dependency surface without a matching benefit.

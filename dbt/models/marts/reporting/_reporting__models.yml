@@ -1,0 +1,162 @@
+version: 2
+
+models:
+  # =========================================================================
+  - name: agg_trade_status_daily
+    description: >
+      The requirement's headline report: trade counts by status per day, over a 400-day
+      spine so a quiet day shows as a zero rather than a gap.
+
+      Note the two date grains, which are deliberately not conflated: accepted trades are
+      counted on TRADE_DATE (the business date), rejected events on the date they were
+      PROCESSED. A trade booked Monday and rejected Tuesday belongs to Monday's trade
+      population and Tuesday's operational workload, and forcing both onto one date makes
+      one of the two views wrong.
+    columns:
+      - name: calendar_date
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null
+
+      - name: reject_rate_pct
+        description: >
+          Rejected events over adjudicated events. Excludes SUPERSEDED from the numerator:
+          a supersession is business rule 2 working, and counting it would make the alert
+          threshold fire on healthy amendment traffic.
+        data_tests:
+          - dbt_utils.expression_is_true:
+              expression: "between 0 and 100"
+              config:
+                where: "reject_rate_pct is not null"
+                severity: error
+
+      - name: reject_rate_7d_pct
+        description: 7-day trailing rate. A single day is noise; the trend shows an upstream regression.
+
+    data_tests:
+      - dbt_utils.expression_is_true:
+          name: agg_daily_status_counts_sum_to_trade_count
+          expression: "live_count + expired_count + cancelled_count = trade_count"
+          config:
+            severity: error
+
+      - dbt_utils.expression_is_true:
+          name: agg_daily_event_verdicts_sum_to_total
+          expression: "events_accepted + events_rejected + events_superseded = events_adjudicated"
+          config:
+            severity: error
+
+  # =========================================================================
+  - name: agg_rejection_analysis
+    description: >
+      Rejections by rule and source system, with concentration analysis. `is_concentrated`
+      distinguishes an upstream contract change (one source dominates a rule) from stale
+      reference data on our side (the rule fires evenly across sources) -- opposite
+      responses, invisible from a total count.
+    columns:
+      - name: rule_code
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('ref_rejection_reason')
+              field: rule_code
+
+      - name: share_of_rule_pct
+        data_tests:
+          - dbt_utils.expression_is_true:
+              expression: "between 0 and 100"
+              config:
+                where: "share_of_rule_pct is not null"
+
+      - name: is_chronic
+        description: Firing continuously for over a month. Either the rule is wrong or it is being ignored.
+
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          name: agg_rejection_grain_is_rule_and_source
+          combination_of_columns:
+            - rule_code
+            - source_system
+          config:
+            severity: error
+
+  # =========================================================================
+  - name: rpt_trade_expiring_soon
+    description: >
+      The settlement team's worklist: trades maturing within `expiring_soon_days`, plus
+      anything already matured but still LIVE.
+
+      The second population is the important one. `is_overdue_for_expiry = true` means the
+      expiry sweep has not run, which means dbt has not run, which means the whole curated
+      layer is stale. It is the cheapest available canary for a silently stopped pipeline.
+    columns:
+      - name: trade_id
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null
+
+      - name: urgency
+        data_tests:
+          - accepted_values:
+              values: ["OVERDUE", "MATURES_TODAY", "IMMINENT", "UPCOMING"]
+              config:
+                severity: error
+
+      - name: is_overdue_for_expiry
+        description: The staleness canary. Any true row means the pipeline has not run recently.
+        data_tests:
+          - accepted_values:
+              values: [false]
+              quote: false
+              config:
+                # ERROR: this must never be true after a successful dbt run, because the
+                # same run that builds this view also runs the expiry sweep. A true row
+                # here after a green build means the sweep is broken.
+                severity: error
+
+  # =========================================================================
+  - name: rpt_data_quality_scorecard
+    description: >
+      The whole platform's health as a single row, for a dashboard header, a Slack digest
+      and an on-call engineer at 3am -- none of whom should have to aggregate four tables.
+
+      RAG thresholds mirror MONITORING.VW_PIPELINE_SLA. The duplication is deliberate so
+      each layer can report when the other is broken, and it is held in sync by
+      tests/singular/assert_sla_thresholds_agree.sql.
+    columns:
+      - name: overall_status
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ["GREEN", "AMBER", "RED"]
+              config:
+                severity: error
+
+      - name: overdue_expiry_trades
+        description: Matured trades still marked LIVE. Must be zero.
+        data_tests:
+          - dbt_utils.expression_is_true:
+              expression: "= 0"
+              config:
+                severity: error
+
+      - name: rules_never_fired
+        description: >
+          Declared rules that have never fired. A rule that never fires is either genuinely
+          never violated or is silently broken, and those look identical from a passing test
+          suite -- which is why the count is surfaced rather than assumed to be zero.
+
+    data_tests:
+      - dbt_utils.expression_is_true:
+          name: scorecard_is_exactly_one_row
+          expression: "1 = 1"
+          config:
+            enabled: false
+      - dbt_expectations.expect_table_row_count_to_equal:
+          value: 1
+          config:
+            severity: error

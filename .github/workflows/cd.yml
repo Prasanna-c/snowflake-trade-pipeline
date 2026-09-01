@@ -1,0 +1,448 @@
+# =============================================================================
+# CD -- deploy to production on a merge to main.
+#
+# THE SHAPE, AND WHY IT IS IN THIS ORDER
+#
+#   terraform plan  ->  approve  ->  terraform apply  ->  deploy SQL  ->  dbt build  ->  docs
+#
+# Each step's output is the next step's precondition, and each is idempotent, so a failure
+# halfway through is recovered by re-running rather than by unpicking.
+#
+# WHY A MANUAL APPROVAL GATE BETWEEN PLAN AND APPLY
+# `terraform apply -auto-approve` against a production Snowflake account is how someone
+# discovers that a refactor of a role module drops and recreates a role, revoking every grant
+# under it. A human reading the plan is a cheap control on an expensive mistake, and GitHub
+# environments make it one line. The plan is uploaded as an artifact and applied verbatim, so
+# what was approved is what runs -- not a fresh plan computed after approval, which could differ.
+#
+# WHY DBT RUNS AFTER THE SQL DEPLOY AND NOT BEFORE
+# The monitoring views select from RAW tables, and dbt's sources select from them too. Deploying
+# the SQL layer first means a fresh account is coherent after one pipeline run rather than two.
+#
+# WHY DEPLOYMENT DOES NOT LOAD DATA
+# This workflow deploys the *platform*. Data arrives from the upstream feed and is processed by
+# the scheduled Airflow DAG. Coupling them would mean a deploy could not be re-run without
+# reprocessing, and that a data problem would look like a deployment problem.
+# =============================================================================
+
+name: CD
+
+on:
+  push:
+    branches: [main]
+    # Only when something that is actually deployed changes. A README-only merge triggering a
+    # production apply is noise that trains people to ignore the notifications.
+    paths:
+      - "terraform/**"
+      - "snowflake/**"
+      - "dbt/**"
+      - "ingestion/**"
+      - "airflow/**"
+      - ".github/workflows/cd.yml"
+  workflow_dispatch:
+    inputs:
+      skip_terraform:
+        description: "Skip the Terraform stage (SQL and dbt only)"
+        type: boolean
+        default: false
+      full_refresh:
+        description: "Rebuild every incremental model from scratch -- expensive, and it rewrites history"
+        type: boolean
+        default: false
+
+concurrency:
+  # Never two production deploys at once, and never cancel one in flight: a half-applied
+  # Terraform state is materially worse than a queued deploy.
+  group: cd-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  NO_COLOR: "1"
+  DBT_TARGET: prod
+
+jobs:
+  # ==========================================================================
+  plan:
+    name: Terraform plan
+    runs-on: ubuntu-latest
+    # Deploying is opt-in per repository, the same convention as CI's warehouse tier. A fresh
+    # clone has no production account behind it, and a CD run that goes red because nobody
+    # ever wired one up says nothing about the code while training everyone to ignore the
+    # badge. `vars` rather than `secrets`, because GitHub does not expose secrets to `if`.
+    if: ${{ !inputs.skip_terraform && vars.SNOWFLAKE_CD_ENABLED == 'true' }}
+    environment: production-plan
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+
+      - name: Write the private key
+        run: |
+          printf '%s' "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/rsa_key.p8"
+          chmod 600 "$RUNNER_TEMP/rsa_key.p8"
+
+      - name: Init
+        working-directory: terraform/envs/prod
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_TERRAFORM_USER }}
+          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
+        run: terraform init
+
+      - name: Plan
+        id: plan
+        working-directory: terraform/envs/prod
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_TERRAFORM_USER }}
+          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -out=tfplan
+          code=$?
+          set -e
+          # -detailed-exitcode: 0 = no changes, 1 = error, 2 = changes present. Distinguishing
+          # 0 from 2 is what lets the apply job be skipped entirely on a no-op deploy, rather
+          # than requesting an approval for a plan that does nothing.
+          case "$code" in
+            0) echo "has_changes=false" >> "$GITHUB_OUTPUT" ;;
+            2) echo "has_changes=true"  >> "$GITHUB_OUTPUT" ;;
+            *) exit "$code" ;;
+          esac
+          terraform show -no-color tfplan > tfplan.txt
+
+      - name: Summarise the plan
+        working-directory: terraform/envs/prod
+        run: |
+          {
+            echo "## Terraform plan"
+            echo
+            echo "Changes: ${{ steps.plan.outputs.has_changes }}"
+            echo
+            echo '```terraform'
+            head -c 60000 tfplan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          # The binary plan, so apply runs exactly what was reviewed. Recomputing the plan after
+          # approval would allow it to differ from what a human agreed to.
+          path: |
+            terraform/envs/prod/tfplan
+            terraform/envs/prod/tfplan.txt
+          retention-days: 14
+
+  # ==========================================================================
+  apply:
+    name: Terraform apply
+    runs-on: ubuntu-latest
+    needs: plan
+    if: ${{ !inputs.skip_terraform && needs.plan.outputs.has_changes == 'true' }}
+    # A protected environment with required reviewers. This is the approval gate; the pause
+    # happens here, before anything is changed.
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: terraform/envs/prod
+
+      - name: Write the private key
+        run: |
+          printf '%s' "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/rsa_key.p8"
+          chmod 600 "$RUNNER_TEMP/rsa_key.p8"
+
+      - name: Init
+        working-directory: terraform/envs/prod
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_TERRAFORM_USER }}
+          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
+        run: terraform init
+
+      - name: Apply the approved plan
+        working-directory: terraform/envs/prod
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_TERRAFORM_USER }}
+          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
+        run: terraform apply -auto-approve tfplan
+
+  # ==========================================================================
+  # Split across the dbt job below, and the split is a dependency, not a preference: the
+  # monitoring views and three alerts select from INTERMEDIATE, CORE and AUDIT objects that
+  # only dbt creates. Snowflake validates a view's SELECT at CREATE time, so deploying them
+  # ahead of dbt fails on any account where those objects do not yet exist -- which is
+  # precisely the first production deploy.
+  deploy-sql-pre:
+    name: Deploy the Snowflake SQL layer (pre-dbt)
+    runs-on: ubuntu-latest
+    needs: [plan, apply]
+    # `always()` plus an explicit failure test, so this still runs when `apply` was skipped
+    # because the plan had no changes -- which is the common case for a dbt-only merge.
+    # The gate is repeated rather than inherited: `always()` means a skipped `plan` does not
+    # stop this job, which is what makes a dbt-only merge work, and equally what would let a
+    # credential-less repository reach Snowflake.
+    if: |
+      always()
+      && vars.SNOWFLAKE_CD_ENABLED == 'true'
+      && needs.plan.result != 'failure'
+      && needs.apply.result != 'failure'
+    environment: production
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_PROD_USER }}
+      SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_PROD_ROLE }}
+      SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_PROD_WAREHOUSE }}
+      SNOWFLAKE_LOAD_WAREHOUSE: ${{ secrets.SNOWFLAKE_PROD_LOAD_WAREHOUSE }}
+      SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_PROD_DATABASE }}
+      SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
+      SNOWFLAKE_NOTIFICATION_INTEGRATION: ${{ vars.SNOWFLAKE_NOTIFICATION_INTEGRATION }}
+      ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e ./ingestion
+
+      - name: Write the private key
+        run: |
+          printf '%s' "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/rsa_key.p8"
+          chmod 600 "$RUNNER_TEMP/rsa_key.p8"
+
+      # Snowflake configuration is set at JOB level rather than repeated per step.
+      #
+      # GitHub Actions does not support YAML anchors -- the workflow parser rejects `&name` and
+      # `*name` -- so the usual way to share a block is not available. A job-level `env` is the
+      # supported equivalent, and it is better here anyway: both steps below must see identical
+      # settings, and two hand-copied blocks are two blocks that can drift.
+      - name: Show what will be applied
+        # A dry run over *every* phase, not just this one. It renders and splits each statement
+        # without connecting, so a templating mistake in the post-dbt files fails here rather
+        # than half an hour later after dbt has already built production.
+        run: python scripts/deploy_snowflake_sql.py --env prod --dry-run
+
+      - name: Apply
+        run: python scripts/deploy_snowflake_sql.py --env prod --phase pre-dbt
+
+  # ==========================================================================
+  dbt:
+    name: dbt build (production)
+    runs-on: ubuntu-latest
+    needs: deploy-sql-pre
+    environment: production
+    # Job-level, for the same reason as `deploy-sql` above: three steps need identical Snowflake
+    # settings, and GitHub Actions has no YAML anchors to share a block with.
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_PROD_USER }}
+      SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_PROD_ROLE }}
+      SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_PROD_WAREHOUSE }}
+      SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_PROD_DATABASE }}
+      SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e ./ingestion
+
+      - name: Write the private key
+        run: |
+          printf '%s' "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/rsa_key.p8"
+          chmod 600 "$RUNNER_TEMP/rsa_key.p8"
+
+      - name: Write the dbt profile
+        # dbt/profiles.yml is gitignored, so the runner has none. The example reads every field
+        # from the environment and holds no secrets.
+        working-directory: dbt
+        run: cp profiles.yml.example profiles.yml
+
+      - name: dbt deps
+        working-directory: dbt
+        run: dbt deps
+
+      - name: dbt build
+        working-directory: dbt
+        # No `--full-refresh` unless explicitly requested. A full refresh rewrites the
+        # incremental history, which for FCT_TRADE_VERSION means rebuilding the audit ledger --
+        # something to do deliberately, never as a side effect of a merge.
+        run: |
+          dbt build --target prod --store-failures \
+            ${{ inputs.full_refresh && '--full-refresh' || '' }}
+
+      - name: Verify the platform is healthy after the deploy
+        # A deploy that leaves the platform RED is not a successful deploy. Reading the same
+        # scorecard the Airflow gate and the alerts read means all three cannot disagree.
+        run: |
+          python scripts/run_sql.py --preset scorecard
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, "ingestion/src")
+          from trade_sim.loaders.snowflake_loader import SnowflakeSession
+
+          with SnowflakeSession(query_tag_suffix="component=cd|step=verify") as session:
+              database = session.settings.database
+              rows = session.execute(
+                  f"select overall_status, overdue_expiry_trades "
+                  f"from {database}.reporting.rpt_data_quality_scorecard"
+              )
+
+          if not rows:
+              # A single-row aggregate returning nothing means the reporting layer did not
+              # build, which a green dbt exit code would otherwise hide.
+              sys.exit("the scorecard is empty -- the reporting layer did not build")
+
+          status = rows[0]["OVERALL_STATUS"]
+          overdue = int(rows[0]["OVERDUE_EXPIRY_TRADES"] or 0)
+          print(f"post-deploy status={status} overdue_expiry_trades={overdue}")
+
+          if overdue:
+              sys.exit(f"{overdue} matured trade(s) still LIVE -- business rule 4 is not applying")
+          if status == "RED":
+              sys.exit("platform health is RED after the deploy; see docs/runbook.md#platform-health-red")
+          PY
+
+      - name: Upload run artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-run-results
+          path: |
+            dbt/target/run_results.json
+            dbt/target/manifest.json
+          retention-days: 90
+
+  # ==========================================================================
+  # The other half of the SQL layer. It runs here, after dbt, because every object it creates
+  # reads something dbt owns. Note that this is also the job that creates the alerts, so a
+  # deploy that fails before this point leaves production without Snowflake-side alerting --
+  # which is why `docs` does not gate on it but a failure here still fails the workflow.
+  deploy-sql-post:
+    name: Deploy the Snowflake SQL layer (post-dbt)
+    runs-on: ubuntu-latest
+    needs: dbt
+    environment: production
+    env:
+      SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_PROD_USER }}
+      SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_PROD_ROLE }}
+      SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_PROD_WAREHOUSE }}
+      SNOWFLAKE_LOAD_WAREHOUSE: ${{ secrets.SNOWFLAKE_PROD_LOAD_WAREHOUSE }}
+      SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_PROD_DATABASE }}
+      SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
+      SNOWFLAKE_NOTIFICATION_INTEGRATION: ${{ vars.SNOWFLAKE_NOTIFICATION_INTEGRATION }}
+      ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e ./ingestion
+
+      - name: Write the private key
+        run: |
+          printf '%s' "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/rsa_key.p8"
+          chmod 600 "$RUNNER_TEMP/rsa_key.p8"
+
+      - name: Apply
+        run: python scripts/deploy_snowflake_sql.py --env prod --phase post-dbt
+
+  # ==========================================================================
+  docs:
+    name: Publish dbt docs
+    runs-on: ubuntu-latest
+    needs: dbt
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write the private key
+        run: |
+          printf '%s' "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/rsa_key.p8"
+          chmod 600 "$RUNNER_TEMP/rsa_key.p8"
+
+      - name: Generate docs
+        working-directory: dbt
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_PROD_USER }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_PROD_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_PROD_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_PROD_DATABASE }}
+          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
+        # `dbt deps` again, and the profile again, because this job has its own runner. Published
+        # on every deploy so the documentation cannot lag the deployed models -- documentation
+        # that is generated manually is documentation that is out of date.
+        run: |
+          cp profiles.yml.example profiles.yml
+          dbt deps
+          dbt docs generate --target prod
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dbt/target
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

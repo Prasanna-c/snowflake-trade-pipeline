@@ -1,0 +1,76 @@
+# ---- Secrets: never commit ----
+.env
+.env.*
+!.env.example
+*.p8
+*.pem
+*.key
+rsa_key*
+secrets.auto.tfvars
+*.tfvars
+!example.tfvars
+# Streamlit reads this file automatically, so it is the obvious place to drop a warehouse
+# password and the easiest one to commit by accident. The tracked .streamlit/config.toml
+# holds presentation settings only.
+.streamlit/secrets.toml
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+# Trailing glob as well as `.venv/`, so side-by-side interpreter environments such as
+# .venv-3.11 are ignored too. A virtualenv is platform-specific and must never travel
+# with the repo -- it is a gigabyte of the wrong binaries.
+.venv-*/
+venv/
+.eggs/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# ---- dbt ----
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+dbt/.user.yml
+dbt/profiles.yml
+
+# ---- Terraform ----
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log
+tfplan
+tfplan.json
+
+# ---- Airflow ----
+airflow/logs/
+airflow/plugins/__pycache__/
+airflow/airflow.db
+airflow/airflow-webserver.pid
+airflow/standalone_admin_password.txt
+
+# ---- Local data / generated payloads ----
+data/
+out/
+*.ndjson
+*.ndjson.gz
+!ingestion/tests/fixtures/*.ndjson
+
+# ---- Editors / OS ----
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# AppleDouble companions from a macOS archive: binary, named after the file they shadow.
+._*
+
+# Editor and tool backups.
+*.bak

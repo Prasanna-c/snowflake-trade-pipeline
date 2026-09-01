@@ -1,0 +1,350 @@
+# =============================================================================
+# Local Airflow for the trade pipeline.
+#
+# Derived from the official Airflow compose file, with four deliberate departures:
+#
+#   1. LocalExecutor, not CeleryExecutor. Celery adds Redis, a worker and a flower container
+#      to demonstrate distributed execution that this DAG never uses -- max_active_runs is 1
+#      and the heavy lifting happens inside Snowflake. LocalExecutor removes three containers
+#      and roughly 1.5 GB of memory from a laptop for zero loss of function. The change to
+#      Celery or Kubernetes is a config change, not a redesign; see
+#      docs/adr/0008-orchestration-choice.md.
+#
+#   2. A custom image (see Dockerfile) rather than _PIP_ADDITIONAL_REQUIREMENTS, so startup
+#      is deterministic and does not need the network.
+#
+#   3. The dbt project and the repo's .env are mounted in. dbt runs inside the container but
+#      the code stays editable on the host, so the develop-run loop does not involve
+#      rebuilding an image.
+#
+#   4. Resource limits on every service. Without them Airflow on Docker Desktop will happily
+#      consume all available memory and get OOM-killed mid-DAG, which presents as a
+#      mysterious task failure rather than as the resource problem it is.
+#
+# Usage:
+#   cd airflow && docker compose up -d          (or `make airflow-up` from the repo root)
+#   open http://localhost:8080                  (admin / admin by default)
+# =============================================================================
+
+x-airflow-common: &airflow-common
+  build:
+    context: ..
+    dockerfile: airflow/Dockerfile
+  image: trade-pipeline/airflow:1.0.0
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW__CORE__FERNET_KEY:-}"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # Two parallel tasks per DAG run. The DAG is mostly a sequential chain and the real work
+    # happens in Snowflake, so more slots would buy nothing and would make it easy to
+    # exhaust a laptop's memory.
+    AIRFLOW__CORE__PARALLELISM: "8"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "4"
+    AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: "1"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # 30s rather than the 5s default. Re-parsing every DAG file every 5 seconds is a
+    # measurable share of a laptop's CPU, and these DAGs change on the order of minutes.
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "30"
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "60"
+    AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.session"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+    AIRFLOW__WEBSERVER__BASE_URL: "http://localhost:8080"
+    AIRFLOW__WEBSERVER__WARN_DEPLOYMENT_EXPOSURE: "false"
+    # Log retention. Without this, a pipeline running hourly fills the volume within weeks
+    # and Airflow fails in a way that looks like a scheduler bug.
+    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+    AIRFLOW__LOGGING__COLORED_CONSOLE_LOG: "false"
+    # Sensors in reschedule mode are counted separately; the sensor here waits up to 90
+    # minutes, so the pool must allow it.
+    AIRFLOW__CORE__DEFAULT_POOL_TASK_SLOT_COUNT: "16"
+
+    # ---- Everything the operator configures ---------------------------------
+    #
+    # Deliberately absent: Snowflake credentials, SMTP settings, ALERT_EMAIL, the DQ
+    # thresholds, DBT_TARGET, DBT_SCHEMA and the simulator knobs. They arrive through
+    # `env_file: ../.env` below, and listing them here as well would break them in two ways.
+    #
+    # First, a key written here wins over env_file, because Compose treats `environment` as
+    # the more specific declaration. `ALERT_EMAIL: "${ALERT_EMAIL:-}"` therefore does not
+    # pass your address through -- it replaces it with an empty string, since Compose
+    # interpolates `${...}` from the shell and from ./.env (this directory), and never from
+    # the file named by env_file. Failure alerts would go nowhere, silently.
+    #
+    # Second, for the keys with no `:-` fallback it is loud instead of silent: Compose prints
+    # "The SNOWFLAKE_ACCOUNT variable is not set" and the container starts with blank
+    # credentials.
+    #
+    # So the rule for this block is: only values that must differ inside the container, or
+    # that are not the operator's to set. Every default lives in the code that reads it --
+    # the DAG defaults the DQ thresholds, trade_sim.config defaults the schema -- which keeps
+    # one default per setting rather than one here and another there.
+
+    # A container path, not the host path in .env: the key is mounted read-only rather than
+    # baked into the image.
+    SNOWFLAKE_PRIVATE_KEY_PATH: /opt/airflow/secrets/rsa_key.p8
+
+    # Paths of the mounts declared below.
+    DBT_PROJECT_DIR: /opt/airflow/dbt
+    DBT_PROFILES_DIR: /opt/airflow/dbt
+
+    # dbt writes its log and its compiled artefacts inside the project directory by default, and
+    # that directory is a host mount -- so a DAG run leaves dbt/logs/dbt.log and dbt/target owned
+    # by the container's user, and the next `make dbt-parse` on the host stops with
+    # "PermissionError: [Errno 13] ... dbt/logs/dbt.log" before it has read a single model.
+    #
+    # Sending both to a named volume means the host and the container never write to the same dbt
+    # artefacts at all. The mount keeps doing what it is there for: the models, editable from the
+    # host without rebuilding the image.
+    DBT_LOG_PATH: /opt/airflow/dbt-artifacts/logs
+    DBT_TARGET_PATH: /opt/airflow/dbt-artifacts/target
+    TRADE_SIM_OUTPUT_DIR: /opt/airflow/data/landing
+    TRADE_SIM_STATE_DIR: /opt/airflow/data/state
+    # Lets scripts/validate_dags.py find the dags folder here, where there is no repo root.
+    AIRFLOW_DAGS_DIR: /opt/airflow/dags
+
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    # dbt project mounted from the host so models are editable without an image rebuild.
+    - ../dbt:/opt/airflow/dbt
+    # Where DBT_LOG_PATH and DBT_TARGET_PATH above point. A named volume rather than a host
+    # directory, deliberately: these artefacts belong to the container's dbt runs, nothing on the
+    # host reads them, and keeping them off the host is the point of the exercise.
+    - dbt-artifacts:/opt/airflow/dbt-artifacts
+    # The simulator, for the same reason. The image installs it editable from this path, so the
+    # mount simply supplies newer source over the copy baked in at build time. Without it the
+    # scheduler runs whichever generator existed when the image was last built, which is a
+    # particularly confusing failure: the DAG loads events whose expectations came from one
+    # version of the rules and reconciles them against another.
+    - ../ingestion:/opt/airflow/ingestion
+    # Generated files and simulator state, shared with the host so `trade-sim reconcile` can
+    # be run locally against what the DAG produced.
+    - ../data:/opt/airflow/data
+    # Private key, read-only. Mounted rather than baked in so the image contains no secret
+    # and can be shared or pushed without thought.
+    - ../.secrets:/opt/airflow/secrets:ro
+    # Read-only so the operational scripts -- DAG validation, run_sql, doctor -- are runnable
+    # from inside the container, which is the only place Airflow itself is installed.
+    - ../scripts:/opt/airflow/scripts:ro
+  user: "${AIRFLOW_UID:-50000}:0"
+  env_file:
+    - ../.env
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  # -------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: trade-airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+      # Airflow issues a lot of small transactions; this keeps the metadata database from
+      # becoming the bottleneck on a laptop.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # -------------------------------------------------------------------------
+  airflow-init:
+    <<: *airflow-common
+    container_name: trade-airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -euo pipefail
+
+        echo "Checking host prerequisites..."
+
+        if [[ ! -f /opt/airflow/secrets/rsa_key.p8 ]]; then
+          echo ""
+          echo "ERROR: no private key at .secrets/rsa_key.p8"
+          echo "Run 'make keypair' on the host first, then register the public key in"
+          echo "Snowflake. See docs/setup.md."
+          echo ""
+          exit 1
+        fi
+
+        if [[ ! -f /opt/airflow/dbt/profiles.yml ]]; then
+          echo ""
+          echo "ERROR: no dbt/profiles.yml"
+          echo "Run: cp dbt/profiles.yml.example dbt/profiles.yml"
+          echo ""
+          exit 1
+        fi
+
+        # AIRFLOW_UID has to be the id of the user who owns the checkout, and this is the place to
+        # say so, because the alternative is silence followed by a puzzle. `data/` is written by the
+        # containers and by the host -- the simulator writes files there, the DAG reads them -- and
+        # the chown below hands it to AIRFLOW_UID on every single start. Set that to the image's
+        # default of 50000 on Linux or WSL and each `docker compose up` quietly takes the directory
+        # away from you again, so a command that worked yesterday fails with
+        # "PermissionError: ... data/state/trade_book.lock" and nothing points at the container.
+        #
+        # The comparison is against a file in the mounted project, which the host user owns by
+        # definition. The `-ge 1000` guard skips Docker Desktop on macOS, where bind mounts are
+        # presented as the container's own user and the two ids agree by construction.
+        # `$$` on every variable the shell must expand, including in these comments -- Compose
+        # substitutes single-dollar references while it reads the file, and a name it does not know
+        # becomes an empty string plus a warning before bash ever sees the script. It is the same
+        # reason the scheduler's healthcheck below writes $${HOSTNAME}. AIRFLOW_UID stays on a single
+        # dollar on purpose: Compose does know that one, from airflow/.env, and the rest of this
+        # script already depends on it being substituted here.
+        # `|| echo 0` so that a stat which cannot answer skips the check instead of ending the
+        # script. `set -e` is in force, and a bare failure here would stop initialisation with no
+        # output at all -- the containers that depend on this one would simply sit at "Waiting",
+        # which is the least diagnosable outcome available. 0 fails the `-ge 1000` guard below.
+        mount_uid="$$(stat -c %u /opt/airflow/dbt/dbt_project.yml 2>/dev/null || echo 0)"
+        if [[ "$${mount_uid}" != "${AIRFLOW_UID}" && "$${mount_uid}" -ge 1000 ]]; then
+          echo ""
+          echo "ERROR: AIRFLOW_UID is ${AIRFLOW_UID}, but this project is owned by uid $${mount_uid}."
+          echo ""
+          echo "Every container start would reassign data/ to ${AIRFLOW_UID}, leaving the host"
+          echo "unable to write the files it shares with the DAG."
+          echo ""
+          echo "From the repository root, not from airflow/:"
+          echo ""
+          echo "  make airflow-uid                 # writes id -u into .env and airflow/.env"
+          echo "  sudo chown -R $${mount_uid} data # take back what an earlier start reassigned"
+          echo "  make airflow-up"
+          echo ""
+          exit 1
+        fi
+
+        mkdir -p /opt/airflow/logs /opt/airflow/data/landing /opt/airflow/data/state
+        mkdir -p /opt/airflow/dbt-artifacts/logs /opt/airflow/dbt-artifacts/target
+
+        # This container is root; the others are AIRFLOW_UID. Directories created above are
+        # therefore root-owned on a first run, and a scheduler that cannot write
+        # logs/dag_processor_manager/ does not merely lose its logs -- DAG file processing
+        # fails, so no row is ever written to the `dag` table. The DAG then parses correctly
+        # from the filesystem, meaning `airflow dags list` shows it, while `airflow dags
+        # trigger` reports "not found in DagModel". Group-writable as well as owned, because
+        # the containers run with group 0.
+        echo "Fixing ownership of the bind-mounted directories..."
+        chown -R "${AIRFLOW_UID}:0" /opt/airflow/logs /opt/airflow/data /opt/airflow/dbt-artifacts
+        chmod -R g+rwX /opt/airflow/logs /opt/airflow/data /opt/airflow/dbt-artifacts
+
+        echo "Migrating the Airflow metadata database..."
+        airflow db migrate
+
+        echo "Creating the admin user..."
+        airflow users create \
+          --username "${_AIRFLOW_WWW_USER_USERNAME:-admin}" \
+          --password "${_AIRFLOW_WWW_USER_PASSWORD:-admin}" \
+          --firstname Trade --lastname Pipeline \
+          --role Admin --email "${ALERT_EMAIL:-admin@localhost}" \
+          || echo "admin user already exists"
+
+        echo "Installing dbt packages..."
+        cd /opt/airflow/dbt && dbt deps || echo "dbt deps failed; run it on the host instead"
+
+        # dbt_packages is the one dbt artefact that has to live in the project directory, which is
+        # the host mount -- and this container is root, so a first run leaves it root-owned and the
+        # host's next `dbt deps` fails trying to replace files it does not own. Handing it to
+        # AIRFLOW_UID fixes that only if AIRFLOW_UID is the host user's id, which is why
+        # .env.example defaults it to 1000 rather than to the image's 50000.
+        chown -R "${AIRFLOW_UID}:0" /opt/airflow/dbt/dbt_packages 2>/dev/null || true
+
+        echo ""
+        echo "Initialisation complete. http://localhost:8080"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      # The username and password are not repeated here: they come from ../.env, and the
+      # command above already falls back to admin/admin when unset.
+      #
+      # AIRFLOW_UID is the exception to this block's rule, and for a structural reason: it is
+      # substituted into `user:` while Compose reads the file, so it has to live in
+      # airflow/.env rather than in the repo's .env. That means it is not in the container's
+      # environment unless named here, and the chown above needs it.
+      AIRFLOW_UID: "${AIRFLOW_UID:-50000}"
+    # Runs as root so it can fix ownership of the bind-mounted log directory, which is the
+    # commonest cause of "Airflow starts but cannot write logs" on macOS.
+    user: "0:0"
+    # No `restart:` policy. This is a one-shot job, and everything it can fail on -- a missing key,
+    # no profiles.yml, an AIRFLOW_UID that is not the host user's -- is a precondition that will
+    # still be wrong on the next attempt. It used to say `on-failure`, which turned a single legible
+    # error into the same paragraph printed every six seconds while the containers that depend on it
+    # sat at "Waiting" indefinitely: the message was right there in the log and completely buried.
+    # Failing once makes Compose report "dependency failed to start" and stop.
+
+  # -------------------------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: trade-airflow-scheduler
+    command: scheduler
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # -------------------------------------------------------------------------
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: trade-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # -------------------------------------------------------------------------
+  # Optional: a shell inside the image, for running dbt or trade-sim by hand in exactly the
+  # environment the DAG uses. Start with:
+  #   docker compose run --rm airflow-cli bash
+  # Kept behind a profile so it does not start with the stack.
+  airflow-cli:
+    <<: *airflow-common
+    container_name: trade-airflow-cli
+    profiles: ["debug"]
+    command: version
+    stdin_open: true
+    tty: true
+
+volumes:
+  postgres-db-volume:
+  dbt-artifacts:

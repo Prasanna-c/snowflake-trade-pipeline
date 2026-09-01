@@ -1,0 +1,156 @@
+version: 2
+
+models:
+  # =========================================================================
+  - name: fct_trade_rejected
+    description: >
+      The compliance record of everything the pipeline refused, plus everything it
+      superseded, distinguished by `disposition`. Append-only and never updated: evidence
+      that can be silently changed is not evidence.
+
+      Carries the original payload verbatim, because the first question about a rejected
+      trade is "what exactly did you receive?" -- and joining back to RAW months later is
+      slow and, once RAW is archived, sometimes impossible.
+
+      Grain: one row per rejected or superseded EVENT, not per trade. A trade rejected four
+      times has four rows, which is what an audit of upstream data quality needs to see.
+    columns:
+      - name: rejection_sk
+        description: Surrogate key over event_sk.
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null
+
+      - name: event_sk
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
+      - name: disposition
+        description: REJECTED (refused) or SUPERSEDED (replaced under business rule 2).
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ["REJECTED", "SUPERSEDED"]
+              config:
+                severity: error
+
+      - name: primary_rule_code
+        description: >
+          The one code to act on first, chosen by category precedence rather than
+          alphabetically: structural, then completeness, reference, temporal, economic,
+          lifecycle, version. An operator told four problems at once needs to know which to
+          fix first.
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+          - relationships:
+              to: ref('ref_rejection_reason')
+              field: rule_code
+              config:
+                severity: error
+
+      - name: remediation_guidance
+        description: >
+          What the upstream team should actually do. A rejection log without remediation
+          just moves the problem to whoever reads it.
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
+      - name: raw_payload
+        description: The event exactly as received. The evidence.
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
+      - name: stored_version
+        description: >
+          Version held at the time of rejection. Without this and effective_prior_version,
+          an RJ001 rejection is unexplainable -- "stale version" means nothing unless both
+          versions are visible.
+
+      - name: violated_rule_codes
+        description: Every rule that fired, so the upstream team gets one list rather than four resubmissions.
+        data_tests:
+          - not_null
+
+    data_tests:
+      - dbt_utils.expression_is_true:
+          name: fct_trade_rejected_superseded_rows_carry_rj009
+          expression: "not (disposition = 'SUPERSEDED' and primary_rule_code <> 'RJ009')"
+          config:
+            severity: error
+
+      - dbt_utils.expression_is_true:
+          name: fct_trade_rejected_primary_code_is_among_violations
+          expression: "array_contains(primary_rule_code::variant, violated_rule_codes)"
+          config:
+            severity: error
+
+  # =========================================================================
+  - name: trade_rule_result
+    description: >
+      One row per (event, rule that fired). Turns a pile of rejections into a short list of
+      conversations: "RJ006 is 71% of rejections and 94% of those come from MUREX" names a
+      team, where a reject rate names nobody.
+
+      Includes WARN and SUPERSEDE hits, not only rejections -- a limit breach that never
+      blocks anything is still something risk needs counted.
+    columns:
+      - name: rule_result_sk
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null
+
+      - name: rule_code
+        data_tests:
+          - not_null
+          - relationships:
+              to: ref('ref_rejection_reason')
+              field: rule_code
+              config:
+                severity: error
+
+      - name: rule_severity
+        data_tests:
+          - accepted_values:
+              values: ["REJECT", "WARN", "SUPERSEDE"]
+              config:
+                severity: error
+
+      - name: rule_phase
+        description: FIELD means an upstream data problem; STATE means a sequencing or lifecycle problem.
+        data_tests:
+          - accepted_values:
+              values: ["FIELD", "STATE"]
+              config:
+                severity: error
+
+      - name: is_blocking
+        description: Whether this hit is what caused the event to be refused, as opposed to a warning on an accepted trade.
+        data_tests:
+          - not_null
+
+    data_tests:
+      - dbt_utils.expression_is_true:
+          name: trade_rule_result_blocking_flag_agrees_with_severity
+          expression: "is_blocking = (rule_severity = 'REJECT')"
+          config:
+            severity: error
+
+      - dbt_utils.unique_combination_of_columns:
+          name: trade_rule_result_one_row_per_event_and_rule
+          combination_of_columns:
+            - event_sk
+            - rule_code
+          config:
+            severity: error

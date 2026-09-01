@@ -1,0 +1,74 @@
+version: 2
+
+snapshots:
+  - name: snp_trade
+    description: >
+      SCD2 history of the golden record: what OUR WAREHOUSE believed about each trade, and
+      for exactly how long. Distinct from FCT_TRADE_VERSION, which records what the upstream
+      system told us.
+
+      Two things appear only here. First, state changes with no corresponding trade event --
+      the expiry sweep transitions a trade because time passed, not because a message
+      arrived, so there is no new version to record in the ledger. Second, point-in-time
+      reconstruction: "the book as it stood at close on 14 August" is a filter on
+      valid_from/valid_to here, where from the version ledger it requires reasoning about
+      which version was current at that instant.
+
+      Uses the `check` strategy over an explicit column list. A `timestamp` strategy would
+      key off dbt_updated_at, which changes on every run, and would therefore write a new
+      row per trade per run forever.
+    columns:
+      - name: trade_id
+        description: Business identifier. Not unique here -- one row per state period.
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
+      - name: dbt_scd_id
+        description: dbt's surrogate key for the snapshot row.
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null
+
+      - name: dbt_valid_from
+        description: When the warehouse started believing this version of the truth.
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
+      - name: dbt_valid_to
+        description: When it stopped. Null for the current row.
+
+      - name: is_expiry_sweep_update
+        description: >
+          Explains a state change that has no corresponding trade event. Without it, an
+          analyst seeing LIVE -> EXPIRED cannot tell whether a message arrived or time
+          simply passed.
+
+      - name: lifecycle_status
+        data_tests:
+          - accepted_values:
+              values: ["LIVE", "EXPIRED", "CANCELLED"]
+              config:
+                severity: error
+
+    data_tests:
+      # Exactly one current row per trade. More than one means the SCD2 close-out has
+      # failed, and every point-in-time query would then double-count.
+      - dbt_utils.unique_combination_of_columns:
+          name: snp_trade_one_current_row_per_trade
+          combination_of_columns:
+            - trade_id
+          config:
+            where: "dbt_valid_to is null"
+            severity: error
+
+      - dbt_utils.expression_is_true:
+          name: snp_trade_validity_period_is_coherent
+          expression: "dbt_valid_to is null or dbt_valid_to > dbt_valid_from"
+          config:
+            severity: error

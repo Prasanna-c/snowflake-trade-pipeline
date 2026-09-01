@@ -1,0 +1,40 @@
+
+  FIRST RUN -- in order. Full detail in docs/setup.md.
+
+  ONE-TIME SETUP
+   1.  make install                     venv, dependencies, pre-commit hooks
+   2.  cp .env.example .env             then fill in SNOWFLAKE_ACCOUNT and SNOWFLAKE_USER
+   3.  cp dbt/profiles.yml.example dbt/profiles.yml
+   4.  make keypair                     generates .secrets/rsa_key.p8 + .pub
+   5.  Register the public key in Snowflake, as ACCOUNTADMIN:
+         ALTER USER <you> SET RSA_PUBLIC_KEY='<contents of .secrets/rsa_key.pub,
+                                              header/footer and newlines removed>';
+   6.  make doctor                      must be all green before continuing
+
+  PROVISION SNOWFLAKE
+   7.  make bootstrap                   terraform, then the SQL layer either side of a first dbt run
+                                        ~3 minutes. Creates warehouses, database, schemas,
+                                        roles, masking policies, stage, pipe, stream, tasks,
+                                        monitoring views and alerts.
+   8.  make doctor                      re-run: the ingestion-layer check now passes too
+
+  FIRST END-TO-END RUN
+   9.  make demo                        generate -> load -> drain -> dbt build -> test -> reconcile
+  10.  make status                      four RAG columns, all should read GREEN
+  11.  make dashboard                   http://localhost:8501
+
+  ORCHESTRATE IT
+  12.  make airflow-up                  http://localhost:8080, admin / admin
+  13.  make airflow-trigger             run the DAG once, watch it in the UI
+
+  WHEN SOMETHING BREAKS
+       make doctor                      local setup and connectivity
+       make status                      which stage is at fault
+       docs/runbook.md                  what to do about it
+
+  NO WAREHOUSE NEEDED (works offline, and is what CI runs)
+       make ci-local                    lint, pytest, dbt parse, DAG validation, selfcheck
+       make dbt-unit-test               the business-rule proofs, against mock data
+       make generate                    write trade files to ./data without touching Snowflake
+
+  make help                             every target

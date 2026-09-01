@@ -1,0 +1,132 @@
+@startuml 04-orchestration-and-gates
+' The DAG, where each quality gate sits, and what each one protects.
+' NOTE on the two syntax traps here, both of which fail quietly rather than loudly:
+'   1. Colour goes in a stereotype AFTER the ';'  --  :label; <<#FBEAEA>>
+'      The older `#FBEAEA:label;` form is rejected inside a partition by
+'      PlantUML 1.2026+, and the parse error is reported against the partition's
+'      closing brace rather than the offending line.
+'   2. Keep each activity label on one source line, using \n escapes.
+'      A real line break inside a coloured activity renders a deprecation
+'      banner into the image itself.
+' Render: make diagrams
+
+title Orchestration — where each gate sits, and what it protects
+
+skinparam backgroundColor #FEFEFE
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam ActivityBorderColor #6B7C8F
+skinparam ActivityBackgroundColor #FFFFFF
+skinparam ActivityDiamondBorderColor #B4553F
+skinparam ActivityDiamondBackgroundColor #FBEAEA
+skinparam NoteBackgroundColor #FFF3D6
+skinparam NoteBorderColor #C8A96A
+
+start
+
+:<b>preflight</b>\nverify the platform is deployable-into;
+note right
+  Fails in seconds with a clear message,
+  instead of 20 minutes later inside dbt
+  with "table does not exist" — which
+  reads like a modelling bug.
+end note
+
+partition "ingest" {
+  :simulate_arrivals;
+  :<b>wait_for_files</b>\nsensor · SLA 45 min · retries 0;
+  note right
+    A sensor already retries by definition.
+    Its SLA fires while it is still running
+    and still <i>correct</i> — the only mechanism
+    that can say "this wait has become abnormal".
+  end note
+  :load_files\nPUT + COPY;
+  :drain_stream\nsingle transaction;
+
+  if (<b>GATE 1 — load integrity</b>\nstuck batch? parse errors > 5%?) then (fail)
+    :<b>STOP</b>\nIngestion lost rows.\nRAW is intact — nothing published.; <<#FBEAEA>>
+    stop
+  else (pass)
+  endif
+}
+
+partition "transform" {
+  :dbt source freshness;
+  if (<b>GATE 2 — source freshness</b>\nqueue older than its SLA?) then (error)
+    :<b>STOP</b>\nAsked to transform data\nthat never arrived.; <<#FBEAEA>>
+    stop
+  else (ok / warn)
+  endif
+
+  :dbt_seed\nreference data;
+  :dbt_run_staging;
+  :<b>dbt_run_adjudication</b>\n19 rules · SLA 20 min;
+
+  if (<b>GATE 3 — reject rate</b>\n>= 50 events and rate > 25%?) then (fail)
+    :<b>STOP</b>\nRules have run, so the rate is measurable\nand every rejection is already logged —\nbut <b>FCT_TRADE is untouched</b>.\nThe golden record still holds\nthe last known-good state.; <<#FBEAEA>>
+    stop
+  else (pass)
+  endif
+
+  :dbt_run_marts\nSLA 25 min;
+  :dbt_test\n162 generic + 6 singular · --store-failures;
+  :<b>dbt_snapshot</b>;
+  note right
+    Snapshot runs <b>after</b> the tests.
+    Historising data that just failed its
+    tests writes a bad state into immutable
+    history, and SCD2 cannot be tidied up
+    without destroying the audit trail
+    that is its whole purpose.
+  end note
+}
+
+partition "verify" {
+  :<b>reconcile</b>\nmanifest ground truth vs actual verdicts;
+  note right
+    The only check that can detect an event
+    that is <b>absent</b>. Everything else
+    validates rows that are present.
+
+    MISSING_EVENT = silent data loss = P1.
+  end note
+
+  if (<b>GATE 4 — publish readiness</b>\noverdue expiry? scorecard RED?) then (fail)
+    :<b>STOP</b>\nPlatform not fit to publish.; <<#FBEAEA>>
+    stop
+  else (pass)
+  endif
+
+  :report_health;
+}
+
+stop
+
+legend left
+  <b>DAG settings are correctness, not tuning</b>
+
+  max_active_runs = 1
+    Two runs would race on the version
+    high-water mark.
+
+  catchup = False
+    Rules evaluate against <i>current</i> state.
+    Replaying last Tuesday would re-adjudicate
+    today's data with last Tuesday's business
+    date. Reprocessing is a deliberate,
+    separate, logged operation.
+
+  <b>Every gate warns before it blocks.</b>
+  Gate 3 warns at 60% of its threshold.
+  A control with one setting is either too
+  tight and gets disabled, or too loose and
+  never fires.
+
+  <b>Overrides are environment variables</b>,
+  so an operator's decision to proceed is
+  explicit and temporary — not a code change.
+endlegend
+
+@enduml

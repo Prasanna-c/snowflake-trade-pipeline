@@ -1,0 +1,106 @@
+version: 2
+
+models:
+  - name: stg_trade_event
+    description: >
+      One row per queued trade event, renamed but not yet typed. The single place any
+      downstream model reads the ingestion queue from, so a change to the ingestion contract
+      touches exactly one model.
+    config:
+      # An enforced contract on the staging boundary. dbt fails the build if a column is
+      # renamed, removed or retyped, instead of letting the change propagate and surface as
+      # a mysterious null three models later.
+      #
+      # This model is a view, so Snowflake cannot enforce the NOT NULL constraints
+      # physically -- `warn_unsupported: false` acknowledges that rather than emitting a
+      # warning on every parse. The column-name and data-type half of the contract IS
+      # enforced on views, and that is the half that catches an upstream rename. Nullability
+      # is covered by the data tests below, which run against real data.
+      contract:
+        enforced: true
+    columns:
+      - name: event_sk
+        description: "{{ doc('event_sk') }}"
+        data_type: number(38,0)
+        constraints:
+          - type: not_null
+            warn_unsupported: false
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null:
+              config:
+                severity: error
+
+      - name: batch_id
+        description: Drain batch this event belongs to. Joins to RAW.LOAD_BATCH.
+        data_type: varchar(50)
+        constraints:
+          - type: not_null
+            warn_unsupported: false
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
+      - name: batch_seq
+        description: "{{ doc('batch_seq') }}"
+        data_type: number(38,0)
+        constraints:
+          - type: not_null
+            warn_unsupported: false
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
+      - name: raw_payload
+        description: "{{ doc('raw_payload') }}"
+        data_type: variant
+        constraints:
+          - type: not_null
+            warn_unsupported: false
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
+      - name: source_file_name
+        description: Stage-relative file name. The root of every lineage question.
+        data_type: varchar(1000)
+        constraints:
+          - type: not_null
+            warn_unsupported: false
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
+      - name: source_file_row_number
+        description: Line number within the file. With the file name, identifies the event uniquely.
+        data_type: number(38,0)
+
+      - name: load_method
+        description: SNOWPIPE or COPY. Retained because the two have different latency profiles.
+        data_type: varchar(20)
+        data_tests:
+          - accepted_values:
+              values: ["SNOWPIPE", "COPY"]
+              config:
+                severity: warn
+
+      - name: load_ts
+        description: When the row landed in RAW.
+        data_type: timestamp_ltz
+        constraints:
+          - type: not_null
+            warn_unsupported: false
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
+      - name: drained_at
+        description: When the stream drain moved the row into the queue.
+        data_type: timestamp_ltz

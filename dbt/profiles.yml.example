@@ -1,0 +1,105 @@
+# =============================================================================
+# Copy to ~/.dbt/profiles.yml, or keep it here and export
+# DBT_PROFILES_DIR=$(pwd)/dbt (which is what the Makefile does).
+#
+#   cp dbt/profiles.yml.example dbt/profiles.yml
+#
+# dbt/profiles.yml is gitignored. Every value is read from the environment, so this
+# file contains no secrets and the same file works locally, in Airflow and in CI.
+# =============================================================================
+
+trade_pipeline:
+  target: dev
+
+  outputs:
+    # -------------------------------------------------------------------------
+    # dev -- a developer's laptop. Models land in DBT_<user>_<layer> schemas, so two
+    # engineers can build the same model concurrently without collision.
+    # -------------------------------------------------------------------------
+    dev:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      schema: "{{ env_var('DBT_SCHEMA', 'DBT_LOCAL') }}"
+
+      # Key-pair authentication. See docs/adr/0006-keypair-authentication.md.
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      private_key_passphrase: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE', '') }}"
+
+      # 4 threads on an XSMALL warehouse. More threads do not make a single-cluster
+      # XSMALL faster -- they just queue, and queued time still bills. Raise this only
+      # together with warehouse size.
+      threads: 4
+
+      # Fail a query that hangs rather than letting it hold the warehouse awake for an
+      # hour. 900s is well above the slowest model here (about 40s at demo volume).
+      query_tag: "project=trade-pipeline|env=dev"
+      client_session_keep_alive: false
+      connect_retries: 3
+      connect_timeout: 30
+      retry_on_database_errors: true
+      retry_all: false
+
+      # Statement-level guard rail.
+      session_parameters:
+        STATEMENT_TIMEOUT_IN_SECONDS: 900
+        # Fail rather than pick an arbitrary winner when a MERGE source has duplicate
+        # join keys. A silent arbitrary winner in trade data is a lost amendment.
+        ERROR_ON_NONDETERMINISTIC_MERGE: true
+        ERROR_ON_NONDETERMINISTIC_UPDATE: true
+        TIMEZONE: UTC
+
+    # -------------------------------------------------------------------------
+    # ci -- ephemeral, one schema per pull request, dropped when the PR closes.
+    # -------------------------------------------------------------------------
+    ci:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      # Set by the workflow to PR_<number>, giving each pull request its own namespace.
+      schema: "{{ env_var('DBT_SCHEMA', 'CI') }}"
+      # A path, as in `dev`, not the key itself. The workflow writes the secret to a mode-600
+      # file under RUNNER_TEMP because the Python steps in the same job -- reconciliation, the
+      # health check -- take a path and nothing else, so the file exists either way. Reading the
+      # key from the environment here as well would mean one job carrying the same secret in two
+      # forms, and every workflow that set only one of them failed on the other.
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      private_key_passphrase: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE', '') }}"
+      threads: 8
+      connect_retries: 3
+      session_parameters:
+        STATEMENT_TIMEOUT_IN_SECONDS: 1800
+        ERROR_ON_NONDETERMINISTIC_MERGE: true
+        TIMEZONE: UTC
+
+    # -------------------------------------------------------------------------
+    # prod -- bare schema names (CORE, AUDIT, ...). Reachable only from CI, because
+    # only CI holds the production service key.
+    # -------------------------------------------------------------------------
+    prod:
+      type: snowflake
+      account: "{{ env_var('SNOWFLAKE_ACCOUNT') }}"
+      user: "{{ env_var('SNOWFLAKE_USER') }}"
+      role: "{{ env_var('SNOWFLAKE_ROLE') }}"
+      database: "{{ env_var('SNOWFLAKE_DATABASE') }}"
+      warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
+      schema: PROD
+      # As in `ci` above: the deploy workflow writes the secret to a mode-600 file under
+      # RUNNER_TEMP, outside the workspace so no artifact upload can pick it up, and both dbt and
+      # the Python health check read it from there.
+      private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH') }}"
+      private_key_passphrase: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PASSPHRASE', '') }}"
+      threads: 12
+      connect_retries: 3
+      retry_on_database_errors: true
+      session_parameters:
+        STATEMENT_TIMEOUT_IN_SECONDS: 3600
+        ERROR_ON_NONDETERMINISTIC_MERGE: true
+        ERROR_ON_NONDETERMINISTIC_UPDATE: true
+        TIMEZONE: UTC

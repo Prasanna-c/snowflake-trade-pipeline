@@ -1,0 +1,44 @@
+default_language_version:
+  python: python3.11
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=512]
+      - id: detect-private-key
+      - id: no-commit-to-branch
+        args: [--branch, main]
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.6
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  # No sqlfluff hook. It only works with the dbt templater here -- the rule catalogue macro
+  # returns a list through dbt's `return()`, which plain Jinja cannot render -- and that templater
+  # compiles the project against a warehouse. A commit hook that needs credentials, a network
+  # round trip and thirty seconds is a hook people learn to pass `--no-verify` around, which costs
+  # more than the SQL style it was checking. `make lint-sql` runs it deliberately, and the
+  # credentialed CI tier runs it on every pull request that has a warehouse behind it.
+
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.97.0
+    hooks:
+      - id: terraform_fmt
+      - id: terraform_validate
+        args: [--tf-init-args=-backend=false]
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.23.3
+    hooks:
+      - id: gitleaks

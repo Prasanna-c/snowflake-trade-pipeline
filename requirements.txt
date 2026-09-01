@@ -1,0 +1,53 @@
+# =============================================================================
+# Pinned so the reviewer reproduces exactly what was demonstrated.
+# Python 3.11 or 3.12.  (Airflow itself runs in Docker, not from this file --
+# see airflow/requirements-airflow.txt.)
+# =============================================================================
+
+# ---- dbt ----
+dbt-core==1.9.4
+dbt-snowflake==1.9.2
+
+# ---- Snowflake ----
+snowflake-connector-python[secure-local-storage,pandas]==3.14.0
+snowflake-snowpark-python==1.27.0
+
+# ---- Ingestion / simulation ----
+pydantic==2.10.6
+pydantic-settings==2.7.1
+Faker==35.0.0
+typer==0.15.1
+rich==13.9.4
+python-dotenv==1.0.1
+orjson==3.10.15
+
+# ---- DataFrames ----
+# Not used directly by anything here: it arrives with the connector's `pandas` extra above, and is
+# pinned so that the version is a decision rather than whatever the resolver picked on the day.
+#
+# Streamlit and the charting library used to sit in this block too, pinned to versions that
+# dashboard/requirements.txt then pinned differently. Both files are installed into the same
+# virtualenv, so the result depended on install order, and pip reported no problem. The dashboard
+# is optional and owns its own dependencies; this file no longer mentions them.
+pandas==2.2.3
+
+# ---- Quality ----
+pytest==8.3.4
+pytest-cov==6.0.0
+freezegun==1.5.1
+ruff==0.9.6
+mypy==1.15.0
+sqlfluff==3.3.1
+sqlfluff-templater-dbt==3.3.1
+pre-commit==4.1.0
+types-requests==2.32.0.20241016
+
+# ---- Transitive, pinned on purpose ----
+# sqlfluff pulls chardet through diff-cover and does not care which version. The Snowflake
+# connector does: its vendored copy of requests accepts chardet >=3.0.2,<6, and anything outside
+# that range makes it print "urllib3 (...) or chardet (...)/charset_normalizer (...) doesn't match a
+# supported version" before the output of every command in the project. Nothing is broken by it --
+# the connector prefers charset_normalizer anyway -- but a banner on every dbt run, every load and
+# every query trains a reader to skip the first two lines of output, and the day one of those lines
+# matters, it gets skipped too.
+chardet==5.2.0

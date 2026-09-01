@@ -1,0 +1,25 @@
+counterparty_id,counterparty_name,lei,country_code,credit_rating,is_active
+CP0001,Aldgate Capital Partners LLP,5493001KJTIIGC8Y1R12,GB,A+,true
+CP0002,Bergstrom Nordic Bank AB,549300ZJTIIGC8Y1R213,SE,AA-,true
+CP0003,Cortez Iberia Inversiones SA,5493004KJTIIGC8Y1R14,ES,BBB+,true
+CP0004,Daiwa Meridian Securities KK,5493005KJTIIGC8Y1R15,JP,A,true
+CP0005,Eiffel Structured Finance SA,5493006KJTIIGC8Y1R16,FR,AA,true
+CP0006,Frankfurter Handelsbank AG,5493007KJTIIGC8Y1R17,DE,AA+,true
+CP0007,Gotham Prime Brokerage Inc,5493008KJTIIGC8Y1R18,US,A-,true
+CP0008,Helvetia Zurich Privatbank AG,5493009KJTIIGC8Y1R19,CH,AAA,true
+CP0009,Iberville Louisiana Trust,5493010KJTIIGC8Y1R20,US,BBB,true
+CP0010,Jakarta Sentral Sekuritas,5493011KJTIIGC8Y1R21,ID,BB+,true
+CP0011,Kowloon Pacific Holdings Ltd,5493012KJTIIGC8Y1R22,HK,A,true
+CP0012,Lombard Street Asset Mgmt,5493013KJTIIGC8Y1R23,GB,A+,true
+CP0013,Maastricht Delta Fondsen NV,5493014KJTIIGC8Y1R24,NL,AA-,true
+CP0014,Nordkapp Energi Trading AS,5493015KJTIIGC8Y1R25,NO,BBB+,true
+CP0015,Osaka Kansai Shoji Co,5493016KJTIIGC8Y1R26,JP,A-,true
+CP0016,Piedmont Alpine SGR SpA,5493017KJTIIGC8Y1R27,IT,BBB,true
+CP0017,Queensway Antipodean Ltd,5493018KJTIIGC8Y1R28,AU,A,true
+CP0018,Rialto Veneto Banca SpA,5493019KJTIIGC8Y1R29,IT,BB,true
+CP0019,Stockholm Vasa Kapital AB,5493020KJTIIGC8Y1R30,SE,AA,true
+CP0020,Tanjong Straits Investments,5493021KJTIIGC8Y1R31,SG,A+,true
+CP0021,Umbria Legacy Holdings Srl,5493022KJTIIGC8Y1R32,IT,D,false
+CP0022,Vantage Bridge Ltd (in admin),5493023KJTIIGC8Y1R33,GB,D,false
+CP0023,Westhafen Rhein Kredit AG,5493024KJTIIGC8Y1R34,DE,A,true
+CP0024,Yokohama Bay Financial Ltd,5493025KJTIIGC8Y1R35,JP,BBB+,true

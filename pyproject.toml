@@ -1,0 +1,69 @@
+# Repo-wide tool configuration. The installable package lives in ingestion/.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["dbt/target", "dbt/dbt_packages", ".venv"]
+# Where first-party code lives, so import sorting groups it last instead of mistaking it for a
+# third-party package. Three roots, none of them the repo root: the installable simulator, and
+# two apps that add their own directory to sys.path at startup because they are run as scripts
+# rather than imported. Without this, `from lib import ...` sorts alongside `import streamlit`
+# and the grouping the code already uses reads as an error.
+#
+# The repo root is deliberately absent. A `streamlit/` directory sits there -- deployment
+# config, not a package -- and including "." would make `import streamlit` resolve to it and be
+# sorted as first-party.
+src = ["ingestion/src", "dashboard", "airflow/dags"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # comprehensions
+    "SIM", # simplify
+    "PTH", # use pathlib
+    # A blind `except Exception` is right in a handful of places here -- alerting must never
+    # be able to fail the task it is reporting on, and a diagnostic must still print. It is
+    # wrong everywhere else. Enabling the rule forces each one to be marked and justified
+    # rather than left to a reader to guess at, and it retires ten `noqa: BLE001` comments
+    # that suppressed a rule nobody had switched on.
+    "BLE", # no blind except
+    "RUF",
+]
+ignore = [
+    "E501",  # line length handled by the formatter
+    "B008",  # typer uses function calls in argument defaults by design
+]
+
+[tool.ruff.lint.per-file-ignores]
+"airflow/dags/*" = ["E402"]      # Airflow DAG files import after docstring/config blocks
+"ingestion/tests/*" = ["S101"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+
+[tool.pytest.ini_options]
+testpaths = ["ingestion/tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: requires a live Snowflake connection (deselect with -m 'not integration')",
+]
+
+[tool.coverage.run]
+source = ["ingestion/src/trade_sim"]
+branch = true

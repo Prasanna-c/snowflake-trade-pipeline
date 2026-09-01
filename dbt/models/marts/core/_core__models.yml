@@ -1,0 +1,407 @@
+version: 2
+
+models:
+  # =========================================================================
+  - name: fct_trade
+    description: |
+      **The golden record.** One row per trade, holding its current version and lifecycle
+      state. This is what risk, P&L and every dashboard read.
+
+      Business rule 4 (mark trades expired once maturity has passed) is implemented here as
+      part of the model's SELECT rather than as a post-hook: the incremental source unions
+      newly-accepted trades with trades already in this table whose maturity has passed
+      while still LIVE. Because the materialization merges on trade_id, re-emitting the
+      second population updates those rows in place. See the header comment in
+      `fct_trade.sql` for why the obvious alternatives are broken.
+
+      Status precedence is CANCELLED > EXPIRED > LIVE. A cancelled trade that later passes
+      its maturity date stays CANCELLED -- it was withdrawn, and it never matured.
+    config:
+      contract:
+        enforced: true
+
+    columns:
+      - name: trade_id
+        description: Business identifier. The grain of this table.
+        data_type: varchar(20)
+        constraints:
+          - type: not_null
+          - type: primary_key
+        data_tests:
+          - unique:
+              config:
+                severity: error
+
+      - name: current_version
+        description: Highest accepted version for this trade.
+        data_type: number(38,0)
+        constraints:
+          - type: not_null
+        data_tests:
+          - dbt_utils.expression_is_true:
+              expression: ">= 1"
+              config:
+                severity: error
+
+      - name: lifecycle_status
+        description: LIVE, EXPIRED or CANCELLED.
+        data_type: varchar(20)
+        constraints:
+          - type: not_null
+        data_tests:
+          - accepted_values:
+              values: ["LIVE", "EXPIRED", "CANCELLED"]
+              config:
+                severity: error
+
+      - name: notional_amount
+        description: Always positive. Direction is in buy_sell.
+        data_type: number(38,4)
+        constraints:
+          - type: not_null
+        data_tests:
+          - dbt_utils.expression_is_true:
+              expression: "> 0"
+              config:
+                severity: error
+          # A distributional check, not a correctness one. A notional many orders of
+          # magnitude outside the observed range is usually a units error (cents booked as
+          # units, or a currency minor-unit mistake) rather than a genuine trade.
+          - dbt_expectations.expect_column_values_to_be_between:
+              min_value: 1
+              max_value: 100000000000
+              config:
+                severity: warn
+
+      - name: notional_currency
+        description: ISO 4217, validated against ref_currency by RJ006.
+        data_type: varchar(3)
+        constraints:
+          - type: not_null
+        data_tests:
+          - relationships:
+              to: ref('ref_currency')
+              field: currency_code
+              config:
+                severity: error
+
+      - name: buy_sell
+        data_type: varchar(4)
+        constraints:
+          - type: not_null
+        data_tests:
+          - accepted_values:
+              values: ["BUY", "SELL"]
+              config:
+                severity: error
+
+      - name: signed_notional_amount
+        description: Notional signed by direction. Precomputed so net-exposure queries cannot get the sign wrong.
+        data_type: number(38,4)
+
+      - name: counterparty_id
+        data_type: varchar(10)
+        constraints:
+          - type: not_null
+        data_tests:
+          - relationships:
+              to: ref('ref_counterparty')
+              field: counterparty_id
+              config:
+                severity: error
+
+      - name: book_id
+        data_type: varchar(30)
+        constraints:
+          - type: not_null
+        data_tests:
+          - relationships:
+              to: ref('ref_book')
+              field: book_id
+              config:
+                severity: error
+
+      - name: product_type
+        data_type: varchar(50)
+        constraints:
+          - type: not_null
+        data_tests:
+          - relationships:
+              to: ref('ref_product')
+              field: product_type
+              config:
+                severity: error
+
+      - name: trade_date
+        data_type: date
+        constraints:
+          - type: not_null
+
+      - name: settlement_date
+        data_type: date
+
+      - name: maturity_date
+        description: Null only for perpetual products.
+        data_type: date
+
+      - name: days_to_maturity
+        description: Negative for a matured trade. Recomputed on every run against business_date.
+        data_type: number(38,0)
+
+      - name: is_expiring_soon
+        description: Live and maturing within `expiring_soon_days`.
+        data_type: boolean
+
+      - name: is_expiry_sweep_update
+        description: >
+          True when this row was last written by the expiry sweep rather than by a trade
+          event. The snapshot uses it to explain a status change with no corresponding
+          version change.
+        data_type: boolean
+
+      - name: uti
+        data_type: varchar(52)
+      - name: last_action
+        data_type: varchar(10)
+      - name: last_version_action
+        data_type: varchar(10)
+      - name: asset_class
+        data_type: varchar(20)
+      - name: settlement_currency
+        data_type: varchar(3)
+      - name: quantity
+        data_type: number(38,4)
+      - name: price
+        data_type: number(38,8)
+      - name: tenor_days
+        data_type: number(38,0)
+      - name: counterparty_name
+        data_type: varchar(200)
+      - name: counterparty_lei
+        data_type: varchar(20)
+      - name: counterparty_country_code
+        data_type: varchar(2)
+      - name: counterparty_credit_rating
+        data_type: varchar(5)
+      - name: book_name
+        data_type: varchar(100)
+      - name: desk
+        data_type: varchar(30)
+      - name: trader_id
+        data_type: varchar(20)
+      - name: execution_venue
+        data_type: varchar(20)
+      - name: clearing_house
+        data_type: varchar(20)
+      - name: legal_entity
+        data_type: varchar(100)
+      - name: is_limit_breach
+        data_type: boolean
+      - name: is_duplicate_uti
+        data_type: boolean
+      - name: warning_rule_codes
+        data_type: array
+      - name: source_system
+        data_type: varchar(50)
+      - name: last_event_timestamp
+        data_type: timestamp_tz
+      - name: last_source_file_name
+        data_type: varchar(1000)
+      - name: last_batch_id
+        data_type: varchar(50)
+      - name: last_event_sk
+        data_type: number(38,0)
+      - name: status_changed_at
+        data_type: timestamp_ltz
+      - name: is_live
+        data_type: boolean
+      - name: is_expired
+        data_type: boolean
+      - name: is_cancelled
+        data_type: boolean
+      - name: dbt_invocation_id
+        data_type: varchar(36)
+      - name: dbt_updated_at
+        data_type: timestamp_ltz
+
+    data_tests:
+      # Business rule 4, asserted directly. If this fails, matured trades are sitting in
+      # the book reporting LIVE -- the exact failure the sweep exists to prevent, and the
+      # most visible possible symptom of a stalled pipeline.
+      - dbt_utils.expression_is_true:
+          name: fct_trade_no_matured_trade_is_still_live
+          expression: >
+            not (lifecycle_status = 'LIVE'
+                 and maturity_date is not null
+                 and maturity_date < to_date('{{ var('business_date') }}'))
+          config:
+            severity: error
+
+      - dbt_utils.expression_is_true:
+          name: fct_trade_status_flags_agree_with_status
+          expression: >
+            (is_live = (lifecycle_status = 'LIVE'))
+            and (is_expired = (lifecycle_status = 'EXPIRED'))
+            and (is_cancelled = (lifecycle_status = 'CANCELLED'))
+          config:
+            severity: error
+
+      - dbt_utils.expression_is_true:
+          name: fct_trade_maturity_is_not_before_trade_date
+          expression: "maturity_date is null or maturity_date >= trade_date"
+          config:
+            severity: error
+
+      - dbt_utils.expression_is_true:
+          name: fct_trade_signed_notional_agrees_with_direction
+          expression: >
+            (buy_sell = 'BUY' and signed_notional_amount = notional_amount)
+            or (buy_sell = 'SELL' and signed_notional_amount = -notional_amount)
+          config:
+            severity: error
+
+      # Every trade in the golden record must have a corresponding version row. A failure
+      # means the two tables have diverged, which would make the audit trail incomplete.
+      - dbt_utils.expression_is_true:
+          name: fct_trade_current_version_exists_in_version_ledger
+          expression: "1 = 1"
+          config:
+            # Implemented as a singular test instead: the assertion needs a join, which an
+            # expression test cannot express.
+            enabled: false
+
+  # =========================================================================
+  - name: fct_trade_version
+    description: >
+      Every accepted version of every trade -- the complete version ledger. Grain is
+      (trade_id, trade_version). FCT_TRADE is the maximum-version projection of this table,
+      which is why the two can never disagree.
+    columns:
+      - name: trade_version_sk
+        description: Surrogate key over (trade_id, trade_version).
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null:
+              config:
+                severity: error
+
+      - name: trade_id
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
+      - name: trade_version
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+
+      - name: version_action
+        description: NEW, AMEND or REPLACE. REPLACE is business rule 2 in action.
+        data_tests:
+          - accepted_values:
+              values: ["NEW", "AMEND", "REPLACE"]
+              config:
+                severity: error
+
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          name: fct_trade_version_grain_is_trade_and_version
+          combination_of_columns:
+            - trade_id
+            - trade_version
+          config:
+            severity: error
+
+      # Version numbering must have no gaps: v1 and v3 with no v2 means an accepted
+      # version was lost, which is silent data loss rather than a cosmetic oddity.
+      # Implemented as a singular test (needs a window function).
+      - dbt_utils.expression_is_true:
+          name: fct_trade_version_positive_versions
+          expression: "trade_version >= 1"
+          config:
+            severity: error
+
+  # =========================================================================
+  - name: dim_counterparty
+    description: >
+      Counterparty reference attributes enriched with observed trading and rejection
+      activity, so a credit officer needs one table rather than a join.
+    columns:
+      - name: counterparty_sk
+        data_tests: [unique, not_null]
+      - name: counterparty_id
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null:
+              config:
+                severity: error
+      - name: lei
+        description: 20-character Legal Entity Identifier. A wrong length fails regulatory reporting.
+        data_tests:
+          - dbt_expectations.expect_column_value_lengths_to_equal:
+              value: 20
+              config:
+                severity: error
+      - name: has_live_trades_while_inactive
+        description: >
+          A control finding rather than a data point: we hold live exposure to a defaulted
+          or offboarded counterparty.
+        data_tests:
+          - accepted_values:
+              values: [false]
+              quote: false
+              config:
+                # WARN: the demo data deliberately contains inactive counterparties, and
+                # in production this is a risk escalation rather than a build failure.
+                severity: warn
+
+  # =========================================================================
+  - name: dim_book
+    description: Book reference attributes with gross-position limit utilisation.
+    columns:
+      - name: book_sk
+        data_tests: [unique, not_null]
+      - name: book_id
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null
+      - name: notional_limit
+        data_tests:
+          - dbt_utils.expression_is_true:
+              expression: "> 0"
+      - name: limit_status
+        description: OK, WARNING at 80% of limit, BREACH above it.
+        data_tests:
+          - accepted_values:
+              values: ["OK", "WARNING", "BREACH"]
+
+  # =========================================================================
+  - name: dim_product
+    description: Product reference attributes with observed tenor and notional characteristics.
+    columns:
+      - name: product_sk
+        data_tests: [unique, not_null]
+      - name: product_type
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null
+      - name: has_maturity_data_inconsistency
+        description: >
+          The product requires a maturity date but trades exist without one -- either the
+          reference data is wrong or an upstream system is omitting a mandatory field.
+        data_tests:
+          - accepted_values:
+              values: [false]
+              quote: false
+              config:
+                severity: warn

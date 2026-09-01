@@ -1,0 +1,162 @@
+version: 2
+
+seeds:
+  # =========================================================================
+  # These CSVs are GENERATED, not hand-edited. The source of truth is
+  # ingestion/src/trade_sim/reference.py, and `trade-sim emit-seeds` writes them.
+  #
+  # The reason: the simulator must know exactly which counterparties are valid in order
+  # to inject a genuinely-unknown one. If the seed and the simulator each held their own
+  # list, they would drift, and the "unknown counterparty" fault would eventually be
+  # injected using a counterparty that had since been onboarded -- a test that quietly
+  # stops testing anything.
+  #
+  # CI runs `trade-sim emit-seeds --check`, which fails if these files differ from what
+  # reference.py would produce.
+  # =========================================================================
+
+  - name: ref_counterparty
+    description: >
+      Counterparty reference data. Deliberately contains two inactive counterparties
+      (CP0021, CP0022) so rule RJ016 has something real to fire on, and deliberately
+      contains nothing in the CP9000-CP9999 range so the simulator's unknown-counterparty
+      fault can never collide with a real entry.
+    columns:
+      - name: counterparty_id
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null
+      - name: lei
+        description: 20-character Legal Entity Identifier.
+        data_tests:
+          - unique
+          - dbt_expectations.expect_column_value_lengths_to_equal:
+              value: 20
+              config:
+                severity: error
+      - name: is_active
+        data_tests:
+          - not_null
+      - name: credit_rating
+        data_tests:
+          - not_null
+
+  - name: ref_currency
+    description: >
+      ISO 4217 currencies. `minor_units` is modelled because JPY and KRW have zero decimal
+      places, and assuming two everywhere turns a 100 yen trade into a 1 yen trade.
+      `is_deliverable` drives RJ017.
+    columns:
+      - name: currency_code
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null
+          - dbt_expectations.expect_column_value_lengths_to_equal:
+              value: 3
+              config:
+                severity: error
+      - name: minor_units
+        data_tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: "between 0 and 4"
+      - name: is_deliverable
+        data_tests:
+          - not_null
+
+  - name: ref_product
+    description: >
+      Supported products. A product absent from here is rejected by RJ013, so this table is
+      the platform's authorisation boundary, not merely a lookup.
+    columns:
+      - name: product_type
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null
+      - name: asset_class
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ["FX", "RATES", "CREDIT", "EQUITY"]
+      - name: is_physically_settled
+        description: Drives RJ017 -- a physically-settled product cannot settle in a non-deliverable currency.
+        data_tests:
+          - not_null
+
+  - name: ref_book
+    description: Trading books with desk attribution and notional limits. Limits drive the RJ018 warning.
+    columns:
+      - name: book_id
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null
+      - name: notional_limit
+        data_tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: "> 0"
+      - name: desk
+        data_tests:
+          - not_null
+
+  - name: ref_rejection_reason
+    description: >
+      The human-readable half of the rule book. The dbt macro `trade_validation_rules()` is
+      the authority for a rule's CONDITION and SEVERITY; this seed is the authority for its
+      DESCRIPTION and REMEDIATION.
+
+      The two are held in sync by `tests/singular/assert_rule_catalogue_matches_macro.sql`,
+      which fails if either side declares a code the other does not.
+    columns:
+      - name: rule_code
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null
+          - dbt_expectations.expect_column_values_to_match_regex:
+              regex: "^RJ[0-9]{3}$"
+              config:
+                severity: error
+      - name: severity
+        data_tests:
+          - not_null
+          - accepted_values:
+              values: ["REJECT", "WARN", "SUPERSEDE"]
+              config:
+                severity: error
+      - name: rule_category
+        data_tests:
+          - not_null
+          - accepted_values:
+              values:
+                - VERSION
+                - TEMPORAL
+                - COMPLETENESS
+                - REFERENCE
+                - ECONOMIC
+                - STRUCTURAL
+                - LIFECYCLE
+                - LIMIT
+              config:
+                severity: error
+      - name: requirement_ref
+        description: >
+          Which stated requirement the rule satisfies. R1-R3 are explicit case-study
+          requirements; OWN marks a control added on top of them.
+        data_tests:
+          - not_null
+      - name: remediation
+        description: What the upstream team should do about it.
+        data_tests:
+          - not_null:
+              config:
+                severity: error

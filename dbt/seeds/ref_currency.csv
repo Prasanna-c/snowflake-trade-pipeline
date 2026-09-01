@@ -1,0 +1,15 @@
+currency_code,currency_name,minor_units,is_deliverable
+USD,US Dollar,2,true
+EUR,Euro,2,true
+GBP,Pound Sterling,2,true
+JPY,Japanese Yen,0,true
+CHF,Swiss Franc,2,true
+AUD,Australian Dollar,2,true
+CAD,Canadian Dollar,2,true
+SEK,Swedish Krona,2,true
+NOK,Norwegian Krone,2,true
+SGD,Singapore Dollar,2,true
+HKD,Hong Kong Dollar,2,true
+KRW,South Korean Won,0,false
+INR,Indian Rupee,2,false
+BRL,Brazilian Real,2,false

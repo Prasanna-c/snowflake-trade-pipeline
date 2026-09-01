@@ -1,0 +1,98 @@
+version: 2
+
+sources:
+  - name: raw
+    description: >
+      Landing zone owned by the ingestion layer, created by
+      `snowflake/10_ingestion/*.sql`. dbt only ever reads from here -- RAW is
+      immutable and is the system of record from which every derived layer can be
+      rebuilt.
+    database: "{{ target.database }}"
+    schema: raw
+
+    # ---------------------------------------------------------------------
+    # Source freshness is how file-arrival delay is detected inside dbt, in
+    # addition to the Snowflake-side alert. `dbt source freshness` is a cheap
+    # standalone command, so Airflow runs it as a gate BEFORE the transformation
+    # rather than discovering staleness afterwards.
+    #
+    # The thresholds match MONITORING.VW_PIPELINE_SLA exactly. Two systems
+    # disagreeing about what "late" means is worse than either threshold.
+    # ---------------------------------------------------------------------
+    config:
+      freshness:
+        warn_after: { count: 45, period: minute }
+        error_after: { count: 90, period: minute }
+      loaded_at_field: load_ts
+
+    tables:
+      - name: trade_event
+        description: >
+          Immutable landing table. One row per line of every file ever received, with
+          the payload stored verbatim as a VARIANT plus full file lineage.
+        columns:
+          - name: event_sk
+            description: Arrival surrogate key. Ordering tie-breaker only -- not gap-free.
+            data_tests:
+              - unique
+              - not_null
+          - name: payload
+            description: The trade event exactly as received. Never modified.
+            data_tests:
+              - not_null
+          - name: source_file_name
+            description: Stage-relative file name. The basis of all lineage questions.
+            data_tests:
+              - not_null
+          - name: load_ts
+            description: When the row landed in Snowflake.
+            data_tests:
+              - not_null
+
+      - name: trade_event_queue
+        description: >
+          The contract between Snowflake ingestion and dbt. Rows drained exactly once
+          from RAW.TRADE_EVENT_STREAM by TASK_DRAIN_TRADE_EVENT_STREAM. This is dbt's
+          only input for trade events.
+        # No freshness here: the queue is legitimately empty once dbt has caught up,
+        # and an empty queue is a healthy state, not a stale one.
+        columns:
+          - name: event_sk
+            data_tests:
+              - unique
+              - not_null
+          - name: batch_id
+            description: Drain batch. Joins to RAW.LOAD_BATCH.
+            data_tests:
+              - not_null
+          - name: batch_seq
+            description: >
+              Total ordering of drains. The version-arbitration rules order events by
+              this, so a gap or a repeat would corrupt version comparison.
+            data_tests:
+              - not_null
+          - name: payload
+            data_tests:
+              - not_null
+
+      - name: load_batch
+        description: One row per processing batch. Joins Snowflake metrics to Airflow runs.
+        columns:
+          - name: batch_id
+            data_tests:
+              - unique
+              - not_null
+          - name: batch_type
+            data_tests:
+              - accepted_values:
+                  values: ["FILE_LOAD", "STREAM_DRAIN"]
+          - name: batch_status
+            data_tests:
+              - accepted_values:
+                  values: ["RUNNING", "SUCCEEDED", "FAILED"]
+
+      - name: copy_error
+        description: >
+          Rows Snowflake could not parse at COPY time. These never reach
+          TRADE_EVENT, so they are invisible to every dbt model -- which is exactly why
+          they are captured here and surfaced by ALERT_PARTIAL_LOAD.

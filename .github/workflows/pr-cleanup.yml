@@ -1,0 +1,131 @@
+# =============================================================================
+# Drop a PR's isolated Snowflake schemas when the PR closes.
+#
+# WHY THIS WORKFLOW EXISTS AT ALL
+#
+# CI builds each PR into `PR_<number>_CORE`, `PR_<number>_AUDIT` and so on, which is what lets
+# two PRs run concurrently without overwriting each other's tables. The cost of that isolation
+# is that every PR leaves several schemas behind, and nobody ever cleans them up by hand.
+#
+# The consequence is not only storage. A Snowflake account accumulating hundreds of stale
+# schemas becomes genuinely hard to navigate, `information_schema` queries slow down, and -- the
+# real problem -- it stops being obvious which objects are live. Someone eventually investigates
+# a data question against `PR_412_CORE` because it was the first match in the object picker.
+#
+# Cleanup is therefore part of the CI design, not an afterthought: an isolation strategy without
+# a teardown is a leak.
+#
+# WHY `on: pull_request: closed` AND NOT A NIGHTLY SWEEP
+# A nightly sweep needs a rule for what is stale, and any such rule is wrong for the PR that
+# has been open for three weeks. Tying teardown to the PR's own lifecycle needs no heuristic.
+# The scheduled sweep below exists only as a backstop for the case where this event was missed
+# -- a workflow disabled during an outage, or a PR closed while Actions was degraded.
+# =============================================================================
+
+name: PR cleanup
+
+on:
+  pull_request:
+    types: [closed]
+  schedule:
+    # Weekly backstop, Sunday 03:00 UTC. Catches schemas whose close event was missed.
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number whose schemas should be dropped"
+        required: true
+        type: string
+
+concurrency:
+  group: pr-cleanup-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  drop-schemas:
+    name: Drop PR schemas
+    runs-on: ubuntu-latest
+    if: vars.SNOWFLAKE_CI_ENABLED == 'true'
+    environment: ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e ./ingestion
+
+      - name: Write the private key
+        run: |
+          printf '%s' "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/rsa_key.p8"
+          chmod 600 "$RUNNER_TEMP/rsa_key.p8"
+
+      - name: Drop
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_CI_USER }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_CI_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_CI_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_CI_DATABASE }}
+          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          IS_SWEEP: ${{ github.event_name == 'schedule' }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import sys
+
+          sys.path.insert(0, "ingestion/src")
+          from trade_sim.loaders.snowflake_loader import SnowflakeSession
+
+          pr_number = os.environ.get("PR_NUMBER") or ""
+          is_sweep = os.environ.get("IS_SWEEP") == "true"
+
+          with SnowflakeSession(query_tag_suffix="component=ci-cleanup") as session:
+              database = session.settings.database
+              schemas = session.execute(f"show schemas in database {database}")
+
+              # Only ever schemas matching the CI naming convention. An unanchored `like 'PR_%'`
+              # would also match a real schema someone named PR_REPORTING, and a cleanup job that
+              # can drop production data is not worth the storage it saves.
+              pattern = re.compile(r"^PR_(\d+)(_[A-Z_]+)?$")
+              candidates = []
+              for row in schemas:
+                  name = str(row.get("name") or row.get("NAME") or "")
+                  match = pattern.match(name.upper())
+                  if not match:
+                      continue
+                  if is_sweep or match.group(1) == pr_number:
+                      candidates.append(name)
+
+              if not candidates:
+                  print(
+                      f"nothing to drop (pr={pr_number or 'n/a'}, sweep={is_sweep})"
+                  )
+                  raise SystemExit(0)
+
+              print(f"dropping {len(candidates)} schema(s): {', '.join(sorted(candidates))}")
+              for name in sorted(candidates):
+                  # CASCADE because a schema with tables cannot be dropped otherwise, and every
+                  # object in these schemas is CI output by construction.
+                  session.execute(f'drop schema if exists {database}."{name}" cascade')
+                  print(f"  dropped {name}")
+
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as handle:
+                      handle.write(f"## PR cleanup\n\nDropped {len(candidates)} schema(s):\n\n")
+                      for name in sorted(candidates):
+                          handle.write(f"- `{name}`\n")
+          PY

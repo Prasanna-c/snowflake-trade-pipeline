@@ -1,0 +1,57 @@
+# =============================================================================
+# What docker must not send to the daemon when building airflow/Dockerfile.
+#
+# The build context is this directory, the repository root, because the image installs the
+# `ingestion` package from source. Without this file the context is the entire working tree:
+# virtualenvs, generated trade files, terraform state and the private key, none of which the
+# image needs. That costs build time on every run, and it puts secrets somewhere they have no
+# reason to be -- a context is uploaded to the daemon whether or not a COPY ever names it.
+#
+# Only two paths are actually copied (see airflow/Dockerfile): the Airflow requirements file
+# and `ingestion`. The dbt project, the data directory and the key reach the container as
+# mounts at run time instead, so they are excluded here without loss.
+# =============================================================================
+
+# ---- Secrets -----------------------------------------------------------------
+.env
+.env.*
+.secrets/
+*.p8
+*.pem
+terraform.tfvars
+*.tfstate
+*.tfstate.*
+
+# ---- Virtualenvs and caches --------------------------------------------------
+.venv/
+.venv*/
+venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---- Version control and CI --------------------------------------------------
+.git/
+.gitignore
+.github/
+
+# ---- Generated and mounted at run time, not built in -------------------------
+data/
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/
+airflow/logs/
+.terraform/
+
+# ---- Editor and OS noise -----------------------------------------------------
+.DS_Store
+._*
+.vscode/
+.idea/
+
+# ---- Documentation and archives ----------------------------------------------
+docs/
+*.tar.gz

@@ -1,0 +1,49 @@
+# =============================================================================
+# Streamlit configuration for the operations dashboard.
+#
+# Committed rather than left to defaults so the dashboard looks and behaves the same for
+# everyone who clones the repo. A monitoring tool whose colours depend on the viewer's local
+# settings is a tool where "it was red on my screen" cannot be trusted.
+#
+# Lives at the REPO ROOT, not in dashboard/. Streamlit resolves .streamlit/config.toml
+# relative to the working directory it was launched from, not relative to the script, and the
+# documented command is `streamlit run dashboard/app.py` from the repo root. Putting it next
+# to app.py looks tidier and is silently ignored.
+# =============================================================================
+
+[theme]
+base = "light"
+# Deutsche Bank blue as the accent. Deliberately not used for any status: red, amber and green
+# are reserved for RAG so that a blue element can never be mistaken for a health signal.
+primaryColor = "#0018A8"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F6F8"
+textColor = "#1F2328"
+font = "sans serif"
+
+[server]
+# No telemetry and no file watcher reloads triggered by dbt writing into target/. Without
+# this, every dbt run restarts the dashboard mid-render.
+fileWatcherType = "poll"
+runOnSave = false
+headless = true
+port = 8501
+# Uploads are not used; disabling the limit reduces the memory Streamlit reserves.
+maxUploadSize = 1
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# Show errors in full. This is an internal tool on a laptop; hiding the exception only means
+# someone reads the terminal instead, which is slower.
+showErrorDetails = "full"
+toolbarMode = "viewer"
+
+[runner]
+# Rerun the script when a cached function's inputs change, but do not magically display
+# bare expressions -- explicit st.* calls only, so nothing renders by accident.
+magicEnabled = false
+fastReruns = true

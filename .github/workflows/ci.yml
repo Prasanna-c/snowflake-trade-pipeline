@@ -1,0 +1,457 @@
+# =============================================================================
+# CI -- runs on every push and pull request.
+#
+# THE ORGANISING PRINCIPLE: two tiers, split by whether a job needs a warehouse.
+#
+# The `offline` jobs need no credentials, so they run on every PR including one opened from a
+# fork, and they run in parallel in about two minutes. They catch the overwhelming majority of
+# mistakes: a syntax error, a broken DAG dependency, an unformatted file, a stale `make` target
+# in an error message, a rule added to the macro but not the seed.
+#
+# The `warehouse` jobs need Snowflake, so they only run when the secret is available. They are
+# where the actual data correctness is proven, and they build into an isolated per-PR schema
+# that is dropped when the PR closes.
+#
+# Splitting them this way matters because a CI suite that cannot run without credentials is a
+# CI suite that does not run on the contribution that most needs checking, and one that always
+# needs a warehouse is slow and expensive enough that people learn to skip it.
+#
+# WHY `dbt build` AND NOT `dbt run` THEN `dbt test`
+# `build` interleaves them in DAG order, so a model whose upstream test failed is never built.
+# With run-then-test, every model gets built on top of data already known to be wrong, and the
+# test failure at the end tells you far less about where the problem started.
+# =============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  # Manual runs, so a warehouse job can be re-triggered without an empty commit.
+  workflow_dispatch:
+
+concurrency:
+  # Cancel a superseded run on the same ref. Without this, pushing three times in a minute
+  # queues three full runs and the two obsolete ones still hold a Snowflake schema each.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default. Jobs that need more ask for it explicitly.
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  DBT_VERSION: "1.9.4"
+  # Never colourise: ANSI escapes in the Actions log viewer are noise, and they break the
+  # log-grepping that failure triage depends on.
+  NO_COLOR: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  # ==========================================================================
+  # TIER 1 -- offline. No credentials, runs on forks, finishes in ~2 minutes.
+  # ==========================================================================
+  lint:
+    name: Lint (ruff, mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            dashboard/requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r dashboard/requirements.txt
+          pip install -e ./ingestion
+
+      - name: Ruff (lint)
+        run: ruff check ingestion airflow/dags dashboard scripts --output-format=github
+
+      - name: Ruff (format)
+        run: ruff format --check ingestion airflow/dags dashboard scripts
+
+      - name: Mypy
+        # Only the simulator is type-checked strictly. It is the code with real invariants --
+        # decimal money, version arithmetic, verdict enums -- where a type error is a data bug.
+        # The DAG and the dashboard are glue whose types are dominated by Any-returning library
+        # calls, so strict checking there produces noise rather than findings.
+        run: mypy ingestion/src
+
+  # SQL linting is not here. It needs the dbt templater, which compiles the project and so
+  # requires a profile and a live connection, which puts it in tier 2 below. The jinja templater
+  # is the usual way to avoid that and does not work on this project: the rule catalogue macro
+  # returns a Python list through dbt's `return()`, undefined in plain Jinja, so every model that
+  # loops over the rules fails to render. See the note at the top of dbt/.sqlfluff.
+
+  pytest:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            dashboard/requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r dashboard/requirements.txt
+          pip install -e ./ingestion
+
+      - name: Simulator and dashboard tests
+        # No Snowflake credentials in the environment, on purpose. Any test that reaches for a
+        # warehouse fails here rather than passing quietly in CI and being untestable locally.
+        run: pytest ingestion/tests dashboard/tests -v --tb=short
+
+      - name: Determinism check
+        # Generate the same batch twice with a fixed seed and compare bytes. The simulator's
+        # reproducibility is what makes reconciliation meaningful -- if the same seed produced
+        # different trades, an expected-verdict mismatch could never be attributed to the
+        # pipeline rather than to the generator.
+        run: |
+          python -m trade_sim.cli generate --trades 500 --batches 1 --out /tmp/gen-a --seed 7
+          python -m trade_sim.cli generate --trades 500 --batches 1 --out /tmp/gen-b --seed 7
+          a=$(cat /tmp/gen-a/**/*.ndjson.gz | sha256sum | cut -d' ' -f1)
+          b=$(cat /tmp/gen-b/**/*.ndjson.gz | sha256sum | cut -d' ' -f1)
+          echo "seed 7 digest a=$a"
+          echo "seed 7 digest b=$b"
+          if [ "$a" != "$b" ]; then
+            echo "::error::the generator is not deterministic for a fixed seed"
+            exit 1
+          fi
+
+  dbt-offline:
+    # Parse only. dbt unit tests execute their fixtures as SQL, so they need a warehouse and run
+    # as part of `dbt build` in tier 2 -- naming them here suggested a coverage this job never had.
+    name: dbt parse (offline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Write the dbt profile
+        # dbt/profiles.yml is gitignored, so a runner has none and every dbt command below would
+        # stop at "Could not find profile named 'trade_pipeline'". Copied from the example rather
+        # than written inline here, so that `parse` validates the profile the project actually
+        # ships instead of a fixture that can quietly drift away from it.
+        working-directory: dbt
+        run: cp profiles.yml.example profiles.yml
+
+      - name: dbt deps
+        working-directory: dbt
+        run: dbt deps
+
+      - name: dbt parse
+        working-directory: dbt
+        # Placeholder credentials. `parse` resolves refs, compiles every Jinja macro and validates
+        # every YAML property without opening a connection, so it catches a broken ref, an
+        # undefined macro or a malformed test config in ~10 seconds and needs nothing real.
+        #
+        # Every value the `ci` target reads has to be present all the same, including the key:
+        # `env_var()` with no default raises during profile rendering, before dbt has decided it
+        # will not be connecting. A password is not among them -- that target authenticates by
+        # key pair, so the SNOWFLAKE_PASSWORD this used to set was read by nothing.
+        env:
+          SNOWFLAKE_ACCOUNT: ci.eu-central-1
+          SNOWFLAKE_USER: CI
+          SNOWFLAKE_ROLE: CI
+          SNOWFLAKE_WAREHOUSE: CI
+          SNOWFLAKE_DATABASE: CI
+          SNOWFLAKE_PRIVATE_KEY_PATH: /dev/null
+          DBT_SCHEMA: CI
+        run: dbt parse --target ci --no-partial-parse
+
+      - name: Upload the manifest
+        # The downstream slim-CI job needs a manifest to diff against, and other jobs use it to
+        # check that documented columns exist. Uploading it here means it is produced once.
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-manifest
+          path: dbt/target/manifest.json
+          retention-days: 7
+
+  airflow-dags:
+    name: Airflow DAG validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Airflow
+        # Under Airflow's constraint file. Installing Airflow without it is how a transitive
+        # dependency silently upgrades a provider and breaks the scheduler.
+        run: |
+          python -m pip install --upgrade pip
+          pip install "apache-airflow==2.10.5" \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.11.txt"
+          pip install -e ./ingestion
+
+      - name: Validate DAGs
+        # More than an import check: also asserts catchup is off, max_active_runs is 1, every
+        # task has a retry policy, a failure callback exists, and every task is reachable from
+        # `start`. That last one catches the @task_group chaining mistake that produces a DAG
+        # which looks correct and runs its stages in parallel.
+        run: python scripts/validate_dags.py
+
+  selfcheck:
+    name: Reference integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r dashboard/requirements.txt
+          pip install -e ./ingestion
+
+      - name: Selfcheck
+        # Verifies the repo does not lie about itself: every `make` command named in an error
+        # message exists, every docs link and anchor resolves, every model the dashboard queries
+        # is defined, and the rule seed matches the rule macro. Prose rots silently, and an
+        # error message pointing at a command that does not exist costs an on-call engineer more
+        # time than no suggestion would.
+        run: python scripts/selfcheck.py
+
+  terraform:
+    name: Terraform validate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        env: [dev, prod]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.10.5"
+
+      - name: Format check
+        run: terraform fmt -check -recursive
+
+      - name: Init
+        # `-backend=false` so no state backend and no credentials are needed. Enough for
+        # validate, which is what this job is for.
+        working-directory: terraform/envs/${{ matrix.env }}
+        run: terraform init -backend=false
+
+      - name: Validate
+        working-directory: terraform/envs/${{ matrix.env }}
+        run: terraform validate
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Gitleaks needs history to scan commits, not just the working tree. A key committed
+          # and then removed in a later commit is still a leaked key.
+          fetch-depth: 0
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================================================
+  # TIER 2 -- needs a warehouse. Skipped when the secret is absent, so forks
+  # and a fresh clone still get a green tier-1 run.
+  # ==========================================================================
+  dbt-warehouse:
+    name: dbt build (isolated PR schema)
+    runs-on: ubuntu-latest
+    needs: [dbt-offline, pytest]
+    # `vars` rather than `secrets` in the condition: GitHub does not expose secrets to `if`,
+    # so the convention is a plain repository variable acting as the feature flag.
+    if: vars.SNOWFLAKE_CI_ENABLED == 'true'
+    environment: ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e ./ingestion
+
+      - name: Write the private key
+        # From a secret to a file, because the Snowflake connector wants a path. Mode 600 and
+        # under RUNNER_TEMP so it is outside the workspace and cannot be picked up by an
+        # artifact upload.
+        run: |
+          printf '%s' "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/rsa_key.p8"
+          chmod 600 "$RUNNER_TEMP/rsa_key.p8"
+
+      - name: Set the PR schema name
+        # One schema per PR, so two concurrent PRs cannot overwrite each other's tables. The
+        # generate_schema_name macro prefixes every model with this, and the cleanup workflow
+        # drops it when the PR closes.
+        run: echo "DBT_SCHEMA=PR_${{ github.event.number || github.run_id }}" >> "$GITHUB_ENV"
+
+      - name: Write the dbt profile
+        # dbt/profiles.yml is gitignored because it is per-developer, so a runner has none and
+        # every dbt command here would fail on "Could not find profile". The example it is copied
+        # from reads every field from the environment and holds no secrets, which is what makes
+        # the copy sufficient rather than a fixture that can drift from the real thing.
+        working-directory: dbt
+        run: cp profiles.yml.example profiles.yml
+
+      - name: dbt deps
+        working-directory: dbt
+        run: dbt deps
+
+      - name: sqlfluff
+        # Here rather than in tier 1 because the dbt templater compiles the project, which needs
+        # this job's profile and key. Before `dbt build`, so a style failure is reported without
+        # having spent warehouse credits first.
+        working-directory: dbt
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_CI_USER }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_CI_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_CI_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_CI_DATABASE }}
+          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
+        run: sqlfluff lint models snapshots tests --format github-annotation-native
+
+      - name: dbt build
+        working-directory: dbt
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_CI_USER }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_CI_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_CI_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_CI_DATABASE }}
+          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
+        # `--full-refresh` because a PR schema is new every time, so there is no incremental
+        # state to preserve and an incremental model would otherwise build empty and pass its
+        # tests vacuously.
+        #
+        # `--store-failures` so a failing test's offending rows are queryable rather than
+        # merely counted, which is the difference between a debuggable CI failure and a rerun.
+        run: |
+          dbt build --target ci --full-refresh --store-failures
+
+      - name: Reconcile
+        # The check no dbt test can perform: compare the generator's ground-truth manifest
+        # against the verdicts the pipeline actually reached. Every dbt test validates rows that
+        # are present; this is the only one that detects an event which is absent.
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_CI_USER }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_CI_ROLE }}
+          SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_CI_WAREHOUSE }}
+          SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_CI_DATABASE }}
+          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
+        run: python -m trade_sim.cli reconcile
+
+      - name: Upload run artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-run-results
+          path: |
+            dbt/target/run_results.json
+            dbt/target/manifest.json
+          retention-days: 7
+
+      - name: Summarise
+        if: always()
+        # Written to the job summary rather than only the log. A reviewer should see the model
+        # and test counts on the PR without opening a log viewer and scrolling.
+        run: |
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, pathlib
+          path = pathlib.Path("dbt/target/run_results.json")
+          if not path.is_file():
+              print("## dbt\n\nNo run_results.json produced.")
+              raise SystemExit
+          results = json.loads(path.read_text())["results"]
+          by_status: dict[str, int] = {}
+          for result in results:
+              by_status[result["status"]] = by_status.get(result["status"], 0) + 1
+          print("## dbt build\n")
+          print("| status | nodes |")
+          print("| --- | --- |")
+          for status, count in sorted(by_status.items()):
+              print(f"| {status} | {count} |")
+          failures = [r for r in results if r["status"] in ("fail", "error")]
+          if failures:
+              print("\n### Failures\n")
+              for result in failures:
+                  print(f"- `{result['unique_id']}`: {result.get('message')}")
+          PY
+
+  # ==========================================================================
+  # Gate. Branch protection requires this one check, so adding a job above does
+  # not mean editing the protection rules -- and a new job cannot be silently
+  # non-blocking, which is the usual way a check stops mattering.
+  # ==========================================================================
+  ci-passed:
+    name: CI passed
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - lint
+      - pytest
+      - dbt-offline
+      - airflow-dags
+      - selfcheck
+      - terraform
+      - secrets
+    steps:
+      - name: Check results
+        # `needs.*.result` is 'skipped' for a job whose `if` was false, which must not count as
+        # a pass for a required job -- but every job listed here is unconditional, so any
+        # 'skipped' means an upstream failure cancelled it.
+        run: |
+          results='${{ join(needs.*.result, " ") }}'
+          echo "job results: $results"
+          for result in $results; do
+            if [ "$result" != "success" ]; then
+              echo "::error::a required job did not succeed ($result)"
+              exit 1
+            fi
+          done
+          echo "all required jobs passed"

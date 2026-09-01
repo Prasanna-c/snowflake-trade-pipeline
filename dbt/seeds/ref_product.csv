@@ -1,0 +1,10 @@
+product_type,asset_class,requires_maturity,is_physically_settled
+FX_SPOT,FX,true,true
+FX_FORWARD,FX,true,true
+FX_SWAP,FX,true,true
+NDF,FX,true,false
+IRS,RATES,true,false
+OIS,RATES,true,false
+CDS,CREDIT,true,false
+EQUITY_SWAP,EQUITY,true,false
+BOND,CREDIT,true,true

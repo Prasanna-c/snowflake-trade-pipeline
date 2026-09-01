@@ -1,0 +1,137 @@
+@startuml 01-architecture
+' Component architecture: which technology owns what, and where the handoffs are.
+' Deliberately shows ownership rather than data flow -- 02-data-flow.puml carries the flow,
+' and duplicating it here is what turned an earlier version of this diagram into spaghetti.
+' Render: make diagrams
+
+title Trade Lifecycle Pipeline — who owns what
+
+skinparam backgroundColor #FEFEFE
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam roundCorner 8
+skinparam ArrowColor #33475B
+skinparam ArrowFontSize 11
+skinparam linetype ortho
+skinparam rectangle {
+  BorderColor #6B7C8F
+  BackgroundColor #FFFFFF
+}
+skinparam package {
+  BorderColor #8899AA
+  FontStyle bold
+  FontSize 13
+}
+
+' ===========================================================================
+' Local machine
+' ===========================================================================
+package "Simulator — Python" as SIM #FFF3D6 {
+  rectangle "generator\nrealistic events,\ninjected faults" as GEN
+  rectangle "writer\nNDJSON +\nmanifest of\nexpected verdicts" as WRITER
+  rectangle "loaders\nPUT + COPY" as LOADER
+  rectangle "reconcile\nmanifest vs verdicts\n= <b>proof of correctness</b>" as RECON
+  GEN -[hidden]right- WRITER
+  WRITER -[hidden]right- LOADER
+  LOADER -[hidden]right- RECON
+}
+
+package "Orchestration — Airflow (Docker)" as AF #D6E6F5 {
+  rectangle "DAG trade_pipeline\nhourly · max_active_runs=1 · catchup=False" as DAG
+  rectangle "ingest\nsensor · load · drain\n<b>gate_load_integrity</b>" as G1
+  rectangle "transform\nfreshness · seed · run · test · snapshot\n<b>gate_reject_rate</b>" as G2
+  rectangle "verify\nreconcile\n<b>gate_publish_readiness</b>" as G3
+  rectangle "alerting\nemail + Slack,\neach with a\nrunbook anchor" as ALERT
+  DAG -down-> G1
+  G1 -right-> G2
+  G2 -right-> G3
+  DAG -[hidden]down- ALERT
+}
+
+package "Presentation — Streamlit" as DASH #EADCF5 {
+  rectangle "4 pages\nscorecard · trade status\nrejections · pipeline health" as PAGES
+  rectangle "lib/queries.py\nall SQL — marts and\nmonitoring <i>only</i>,\nenforced by a test" as QUERIES
+  PAGES -down-> QUERIES
+}
+
+' ===========================================================================
+' Snowflake
+' ===========================================================================
+package "Snowflake" as SF #DFF2E4 {
+
+  package "Ingestion — SQL scripts" as ING {
+    rectangle "@RAW.TRADE_LANDING\ninternal stage" as STAGE
+    rectangle "RAW.TRADE_EVENT\nimmutable · VARIANT\n14-day Time Travel" as RAWT
+    rectangle "RAW.COPY_ERROR\nunparseable lines" as CERR
+    rectangle "RAW.LOAD_BATCH\none row per attempt" as LB
+  }
+
+  package "Change capture — Streams & Tasks" as CDC {
+    rectangle "TRADE_EVENT_STREAM\nAPPEND_ONLY\ntransactional offset" as STREAM
+    rectangle "SP_DRAIN_...\n<b>single transaction</b>" as DRAIN
+    rectangle "TASK_DRAIN — 1 min\ngated on\nSTREAM_HAS_DATA" as TASK
+    rectangle "RAW.TRADE_EVENT_QUEUE\n<b>the contract dbt reads</b>" as QUEUE
+  }
+
+  package "Transformation — dbt" as DBT {
+    rectangle "staging\nviews · rename only" as STG
+    rectangle "intermediate\ntyped → adjudicated\n<b>19 rules</b>" as INT
+    rectangle "marts.core\nFCT_TRADE\nFCT_TRADE_VERSION\ndimensions" as CORE
+    rectangle "audit\nFCT_TRADE_REJECTED\nTRADE_RULE_RESULT" as AUD
+    rectangle "snapshots\nSNP_TRADE — SCD2" as SNAP
+    rectangle "marts.reporting\naggregates +\nDQ scorecard" as REP
+  }
+
+  package "Observability — SQL scripts" as OBS {
+    rectangle "10 monitoring views\nvw_pipeline_sla is\nthe triage view" as VIEWS
+    ' A <b>..</b> pair cannot span a \n -- the closing tag would render literally.
+    rectangle "8 alerts\non Snowflake's own schedule\n<b>independent of Airflow</b>" as ALERTS
+    rectangle "AUDIT.DBT_RUN_RESULT\nwritten by a dbt\non-run-end hook" as DRR
+  }
+}
+
+' ===========================================================================
+' Provisioning
+' ===========================================================================
+package "Provisioning" as PROV #F5E2D6 {
+  rectangle "Terraform\nwarehouses · database\ntwo-tier RBAC\ntags + masking\nresource monitors" as TF
+  rectangle "GitHub Actions\nCI: offline + warehouse tiers\nCD: plan / approve / apply" as GHA
+  GHA -down-> TF
+}
+
+cloud "Upstream capture\nsystems" as UP #EFEFEF
+
+' ===========================================================================
+' Handoffs between technologies -- the only edges this diagram draws.
+' ===========================================================================
+UP .down.> GEN : simulated by
+LOADER -down-> STAGE : PUT
+STAGE -down-> RAWT : COPY INTO
+STAGE -down-> CERR
+LOADER -down-> LB
+RAWT -down-> STREAM
+STREAM -right-> DRAIN
+TASK .right.> DRAIN
+DRAIN -right-> QUEUE
+QUEUE -down-> STG : dbt source\n+ freshness SLA
+STG -down-> INT
+INT -down-> CORE
+INT -down-> AUD
+CORE -down-> SNAP
+CORE -down-> REP
+AUD -right-> REP
+DRR -up-> VIEWS
+VIEWS -right-> ALERTS
+REP .up.> QUERIES : read by
+VIEWS .up.> QUERIES : read by
+DAG .right.> SF : drives
+TF .down.> SF : provisions
+
+legend bottom
+  <b>Business logic lives only in dbt.</b>
+  Python generates, moves and proves. Airflow sequences and gates.
+  Nothing that decides whether a trade is valid is written outside SQL.
+endlegend
+
+@enduml

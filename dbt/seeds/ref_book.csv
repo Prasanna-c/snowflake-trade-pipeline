@@ -1,0 +1,8 @@
+book_id,book_name,desk,legal_entity,notional_limit
+BK-FX-LDN-01,FX Cash London,FX_CASH,DB London Branch,250000000.00
+BK-FX-LDN-02,FX Forwards London,FX_FWD,DB London Branch,300000000.00
+BK-FX-SGP-01,FX Cash Singapore,FX_CASH,DB Singapore Branch,150000000.00
+BK-RT-FRA-01,Rates Flow Frankfurt,RATES_FLOW,DB AG Frankfurt,500000000.00
+BK-RT-FRA-02,Rates Structured Frankfurt,RATES_STRUCT,DB AG Frankfurt,400000000.00
+BK-CR-NYC-01,Credit Flow New York,CREDIT_FLOW,DB Securities Inc,200000000.00
+BK-EQ-LDN-01,Equity Derivatives London,EQD,DB London Branch,100000000.00

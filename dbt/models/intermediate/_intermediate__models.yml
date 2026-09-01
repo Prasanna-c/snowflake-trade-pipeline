@@ -1,0 +1,244 @@
+version: 2
+
+models:
+  # =========================================================================
+  - name: int_trade_event_typed
+    description: >
+      The VARIANT payload turned into typed columns, with every failed cast recorded
+      rather than silently nulled. `cast_failure_count` and `cast_failed_fields` are what
+      let the pipeline tell an upstream team "you sent notional_amount in a format we
+      cannot read" (RJ008) instead of the misleading "you did not send notional_amount"
+      (RJ004).
+    columns:
+      - name: event_sk
+        description: Arrival surrogate key.
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null:
+              config:
+                severity: error
+
+      - name: trade_id
+        description: >
+          Business identifier, trimmed. Nullable here on purpose -- a missing trade_id is
+          a rule violation to be recorded downstream, not a reason to fail the build.
+
+      - name: trade_version
+        description: Version as an integer, or null if it could not be cast.
+        data_tests:
+          # WARN, not error: a non-positive version is an upstream defect that RJ004
+          # rejects. Failing the build would mean one bad message stops the pipeline for
+          # every other trade, which is the opposite of what we want.
+          - dbt_utils.expression_is_true:
+              expression: "> 0"
+              config:
+                where: "trade_version is not null"
+                severity: warn
+
+      - name: cast_failure_count
+        description: Number of fields present in the payload that failed to cast. Feeds RJ008.
+        data_tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+
+      - name: cast_failed_fields
+        description: Names of the fields that failed to cast, so the rejection is actionable.
+
+      - name: missing_mandatory_fields
+        description: Names of the absent mandatory fields. Feeds the RJ004 detail.
+
+      - name: uti_distinct_trade_count
+        description: Distinct trade_ids sharing this UTI. Greater than one feeds RJ019.
+        data_tests:
+          - not_null
+
+      - name: effective_event_ts
+        description: >
+          Business timestamp with a fallback to arrival time. The primary ordering key for
+          version arbitration -- business time ranks ahead of arrival time because network
+          reordering is real and the upstream clock is the authority on what happened.
+        data_tests:
+          - not_null
+
+    data_tests:
+      # Consistency of the diagnostic columns with the count derived from them. If these
+      # drift, the RJ008 rejections stop naming the right fields and the rejection report
+      # becomes untrustworthy -- worse than having no report.
+      - dbt_utils.expression_is_true:
+          name: int_typed_cast_failure_count_matches_field_array
+          expression: "cast_failure_count = array_size(cast_failed_fields)"
+          config:
+            severity: error
+
+  # =========================================================================
+  - name: int_trade_event_adjudicated
+    description: |
+      **The rule engine's output.** One row per event ever processed, with its verdict and
+      the rule codes that produced it. Everything downstream is a projection of this table.
+
+      This model is also the authority on the currently-stored version of each trade, which
+      is how business rule 1 is evaluated without creating a cycle in the dbt DAG: an
+      incremental model may read `{{ this }}`, so the adjudication log is legally available
+      as prior state.
+
+      {{ doc('adjudication_pipeline') }}
+
+      ### The rule book
+
+      The authoritative, executable rule list is `macros/rules/trade_validation_rules.sql`.
+      The same set of codes is queryable as reference data in `CORE.REF_REJECTION_REASON`,
+      with descriptions and remediation guidance for each. The two are held in agreement by
+      `tests/singular/assert_rule_catalogue_matches_macro.sql`, which fails the build if
+      either side declares a code or a severity the other does not.
+
+      The rule table is not inlined here: dbt renders YAML descriptions in a restricted
+      context with no access to project macros, so an inlined table would have to be
+      hand-maintained -- exactly the drift this project avoids elsewhere.
+    config:
+      # Routed to its own warehouse. This is the only heavy model in the project -- it
+      # evaluates 19 rules and three window functions over the full event population --
+      # and sizing the whole run for it would mean paying for a LARGE warehouse to build
+      # a dimension with 24 rows.
+      snowflake_warehouse: "{{ env_var('SNOWFLAKE_TRANSFORM_WAREHOUSE', env_var('SNOWFLAKE_WAREHOUSE', 'WH_TRADES_TRANSFORM_DEV')) }}"
+
+    columns:
+      - name: event_sk
+        description: Merge key. Makes reprocessing a batch idempotent.
+        data_tests:
+          - unique:
+              config:
+                severity: error
+          - not_null:
+              config:
+                severity: error
+
+      - name: verdict
+        description: ACCEPTED, REJECTED or SUPERSEDED.
+        data_tests:
+          - not_null:
+              config:
+                severity: error
+          - accepted_values:
+              values: ["ACCEPTED", "REJECTED", "SUPERSEDED"]
+              config:
+                severity: error
+
+      - name: version_action
+        description: >
+          What an accepted event did to the trade: NEW, AMEND or REPLACE. REPLACE is
+          business rule 2 -- a same-version resend that overwrote the stored economics.
+          Null for rejected and superseded events.
+        data_tests:
+          - accepted_values:
+              values: ["NEW", "AMEND", "REPLACE"]
+              config:
+                where: "version_action is not null"
+                severity: error
+
+      - name: violated_rule_codes
+        description: Every rule that fired, so an upstream team is told all its problems at once.
+        data_tests:
+          - not_null
+
+      - name: violated_rule_codes_csv
+        description: >
+          violated_rule_codes as a comma-delimited string, in rule-definition order. Exists
+          so a rejection report is legible without unpacking a variant, and so the codes can
+          be asserted in a unit test -- a fixture cannot express an ARRAY on Snowflake.
+
+          Not tested for null deliberately. The column was added after this table was first
+          built, and an incremental model appends new columns as NULL for rows that already
+          exist, so a not_null test would fail on history rather than on a defect.
+          violated_rule_codes itself is tested, and this is derived from it.
+
+      - name: warning_rule_codes_csv
+        description: The WARN-severity subset of violated_rule_codes_csv. Empty for most events.
+
+      - name: effective_prior_version
+        description: >
+          High-water mark this event was arbitrated against: the greater of the stored
+          version and the highest version already accepted earlier in this run. Zero means
+          the trade was previously unknown.
+        data_tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+
+      - name: intra_run_rank
+        description: >
+          Rank among field-valid events sharing this (trade_id, trade_version). Rank 1
+          wins; the rest are SUPERSEDED under business rule 2.
+        data_tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: ">= 1"
+
+      - name: raw_payload
+        description: >
+          The original payload, carried alongside the verdict so a compliance question
+          months later does not require joining back to RAW.
+        data_tests:
+          - not_null
+
+    data_tests:
+      # ---- Invariants of the verdict itself. All errors: if any of these fail, the
+      # ---- rule engine is not doing what its documentation claims.
+      - dbt_utils.expression_is_true:
+          name: adjudicated_accepted_events_have_no_reject_codes
+          expression: >
+            not (verdict = 'ACCEPTED'
+                 and arrays_overlap(violated_rule_codes, {{ rule_code_array('REJECT') }}))
+          config:
+            severity: error
+
+      - dbt_utils.expression_is_true:
+          name: adjudicated_rejected_events_have_at_least_one_reject_code
+          expression: >
+            not (verdict = 'REJECTED'
+                 and not arrays_overlap(violated_rule_codes, {{ rule_code_array('REJECT') }}))
+          config:
+            severity: error
+
+      - dbt_utils.expression_is_true:
+          name: adjudicated_superseded_events_carry_rj009
+          expression: "not (verdict = 'SUPERSEDED' and not array_contains('RJ009'::variant, violated_rule_codes))"
+          config:
+            severity: error
+
+      - dbt_utils.expression_is_true:
+          name: adjudicated_accepted_events_have_identity
+          expression: "not (verdict = 'ACCEPTED' and (trade_id is null or trade_version is null))"
+          config:
+            severity: error
+
+      # Business rule 1, asserted directly: nothing accepted may be below its high-water
+      # mark. This is the single most important test in the project.
+      - dbt_utils.expression_is_true:
+          name: adjudicated_no_accepted_event_is_below_high_water_mark
+          expression: "not (verdict = 'ACCEPTED' and trade_version < effective_prior_version)"
+          config:
+            severity: error
+
+      # Business rule 2, asserted directly: only one accepted event may survive per
+      # (trade_id, version). The rest must be recorded as SUPERSEDED.
+      - dbt_utils.unique_combination_of_columns:
+          name: adjudicated_one_accepted_event_per_trade_version
+          combination_of_columns:
+            - trade_id
+            - trade_version
+          config:
+            where: "verdict = 'ACCEPTED' and trade_id is not null"
+            severity: error
+
+      - dbt_utils.expression_is_true:
+          name: adjudicated_version_action_agrees_with_high_water_mark
+          expression: >
+            version_action is null
+            or (version_action = 'NEW' and effective_prior_version = 0)
+            or (version_action = 'REPLACE' and trade_version = effective_prior_version)
+            or (version_action = 'AMEND' and trade_version > effective_prior_version)
+          config:
+            severity: error

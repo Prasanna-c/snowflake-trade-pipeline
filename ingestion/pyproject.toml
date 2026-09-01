@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trade-sim"
+version = "1.0.0"
+description = "Trade event simulator and Snowflake loader for the trade lifecycle pipeline."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "Faker>=35.0",
+    "typer>=0.15",
+    "rich>=13.9",
+    "python-dotenv>=1.0",
+    "orjson>=3.10",
+    "snowflake-connector-python>=3.14",
+]
+
+[project.scripts]
+trade-sim = "trade_sim.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+trade_sim = ["py.typed"]

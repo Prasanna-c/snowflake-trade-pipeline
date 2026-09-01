@@ -1,0 +1,94 @@
+version: 2
+
+unit_tests:
+
+  # =========================================================================
+  # PRESENCE vs CASTABILITY
+  #
+  # int_trade_event_typed's only real job is to answer two questions per field --
+  # "was it sent?" and "could it be read?" -- because RJ008 (malformed) and RJ004
+  # (missing) are decided by comparing the answers. The adjudication unit tests mock
+  # this model's output, so they assert what the rules do with those answers and
+  # cannot catch it producing the wrong ones. That gap is what this file closes.
+  # =========================================================================
+  - name: json_null_counts_as_absent_not_as_a_failed_cast
+    model: int_trade_event_typed
+    description: >
+      A VARIANT path yields JSON null for "quantity": null and SQL NULL for an absent
+      key, and Snowflake's IS NOT NULL cannot tell either from a real value. Treating
+      JSON null as sent makes it indistinguishable from a value that failed to cast,
+      which rejects RJ008 every event whose product has no quantity -- most of the
+      book. The malformed case is asserted alongside it so that a fix which simply
+      stops detecting cast failures fails here too.
+    given:
+      # SQL format, not the usual dict: a dict fixture renders each literal through
+      # TRY_CAST, and there is no string-to-VARIANT conversion, so the payloads have
+      # to be built with parse_json to be VARIANT objects rather than VARIANT strings.
+      # Columns are those of stg_trade_event, in its order.
+      - input: ref('stg_trade_event')
+        format: sql
+        rows: |
+          select 1 as event_sk,
+                 'B0000001' as batch_id,
+                 1 as batch_seq,
+                 parse_json('{"quantity": 500}') as raw_payload,
+                 'trades.ndjson' as source_file_name,
+                 1 as source_file_row_number,
+                 'FILE' as load_method,
+                 to_timestamp_ltz('2026-06-15 09:00:00') as load_ts,
+                 to_timestamp_ltz('2026-06-15 09:00:05') as drained_at
+          union all
+          select 2, 'B0000001', 2, parse_json('{"quantity": null}'), 'trades.ndjson', 2,
+                 'FILE', to_timestamp_ltz('2026-06-15 09:00:00'),
+                 to_timestamp_ltz('2026-06-15 09:00:05')
+          union all
+          select 3, 'B0000001', 3, parse_json('{}'), 'trades.ndjson', 3,
+                 'FILE', to_timestamp_ltz('2026-06-15 09:00:00'),
+                 to_timestamp_ltz('2026-06-15 09:00:05')
+          union all
+          select 4, 'B0000001', 4, parse_json('{"quantity": "1,234"}'), 'trades.ndjson', 4,
+                 'FILE', to_timestamp_ltz('2026-06-15 09:00:00'),
+                 to_timestamp_ltz('2026-06-15 09:00:05')
+    expect:
+      rows:
+        # Sent and castable.
+        - {event_sk: 1, quantity: 500, has_quantity: true, cast_failure_count: 0}
+        # Sent as JSON null: not a value, so not a failure either.
+        - {event_sk: 2, quantity: null, has_quantity: false, cast_failure_count: 0}
+        # Key absent: the same answer, by the other route.
+        - {event_sk: 3, quantity: null, has_quantity: false, cast_failure_count: 0}
+        # Sent, and genuinely unreadable. This is the one RJ008 exists for.
+        - {event_sk: 4, quantity: null, has_quantity: true, cast_failure_count: 1}
+
+  # =========================================================================
+  # NORMALISATION
+  #
+  # Case and padding are not data quality failures. Upstream systems differ on both,
+  # and rejecting a trade for sending "usd" would generate work for a trade capture
+  # team without protecting anything downstream. The simulator's fault catalogue
+  # relies on this being true: a corruption token is only a fault if it is still
+  # invalid after normalisation, which is why "usd" and "buy" are not in the token
+  # lists and why this test exists to say what happens to them instead.
+  # =========================================================================
+  - name: case_and_padding_are_normalised_not_rejected
+    model: int_trade_event_typed
+    description: >
+      Identifiers are trimmed and upper-cased before any rule sees them, so a
+      lower-case currency or direction is read as the value it means rather than
+      reported as unknown.
+    given:
+      - input: ref('stg_trade_event')
+        format: sql
+        rows: |
+          select 1 as event_sk,
+                 'B0000002' as batch_id,
+                 1 as batch_seq,
+                 parse_json('{"buy_sell": "buy", "notional_currency": "  usd  ", "counterparty_id": "cp0001"}') as raw_payload,
+                 'trades.ndjson' as source_file_name,
+                 1 as source_file_row_number,
+                 'FILE' as load_method,
+                 to_timestamp_ltz('2026-06-15 09:00:00') as load_ts,
+                 to_timestamp_ltz('2026-06-15 09:00:05') as drained_at
+    expect:
+      rows:
+        - {event_sk: 1, buy_sell: "BUY", notional_currency: "USD", counterparty_id: "CP0001", cast_failure_count: 0}
