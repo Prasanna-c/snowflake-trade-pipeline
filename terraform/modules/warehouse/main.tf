@@ -36,8 +36,8 @@ resource "snowflake_resource_monitor" "workload" {
   # Defence in depth: warn early, throttle new queries at 90%, hard-stop at
   # 100%. On a 30-day trial this is what prevents a runaway task loop from
   # burning the entire credit allowance overnight.
-  notify_triggers          = [50, 75, 90]
-  suspend_trigger          = 90
+  notify_triggers           = [50, 75, 90]
+  suspend_trigger           = 90
   suspend_immediate_trigger = 100
 }
 
@@ -70,7 +70,7 @@ resource "snowflake_warehouse" "this" {
 
   # Query acceleration offloads scan-heavy outliers to serverless compute so a
   # single large backfill does not force us to permanently size up.
-  enable_query_acceleration          = each.value.enable_query_acceleration
+  enable_query_acceleration           = each.value.enable_query_acceleration
   query_acceleration_max_scale_factor = each.value.enable_query_acceleration ? 8 : null
 
   resource_monitor = try(snowflake_resource_monitor.workload[each.key].name, null)

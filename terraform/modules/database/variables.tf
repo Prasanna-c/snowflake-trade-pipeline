@@ -19,8 +19,8 @@ variable "data_retention_time_in_days" {
     Time Travel window for non-transient schemas. Standard edition caps this at
     1 day; Enterprise allows up to 90. Keep dev at 1 to save storage.
   EOT
-  type    = number
-  default = 1
+  type        = number
+  default     = 1
 
   validation {
     condition     = var.data_retention_time_in_days >= 0 && var.data_retention_time_in_days <= 90

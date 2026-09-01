@@ -38,7 +38,7 @@ output "masking_policies" {
 # ---------------------------------------------------------------------------
 output "dotenv_snippet" {
   description = "Environment variables for .env, derived from what was actually created."
-  value = <<-EOT
+  value       = <<-EOT
     SNOWFLAKE_DATABASE=${module.database.database_name}
     SNOWFLAKE_USER=${module.rbac.service_user_names["dbt"]}
     SNOWFLAKE_ROLE=${module.rbac.functional_role_names["TRANSFORM"]}

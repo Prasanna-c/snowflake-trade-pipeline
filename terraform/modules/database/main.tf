@@ -43,31 +43,31 @@ locals {
       transient = false
     }
     STAGING = {
-      comment = "Typed, renamed, lightly-cleaned 1:1 views over RAW. No business logic."
+      comment   = "Typed, renamed, lightly-cleaned 1:1 views over RAW. No business logic."
       transient = true
     }
     INTERMEDIATE = {
-      comment = "Business-rule engine: deduplication, version arbitration, validation verdicts."
+      comment   = "Business-rule engine: deduplication, version arbitration, validation verdicts."
       transient = true
     }
     CORE = {
-      comment = "Conformed facts and dimensions. FCT_TRADE is the golden record."
+      comment   = "Conformed facts and dimensions. FCT_TRADE is the golden record."
       transient = false
     }
     REPORTING = {
-      comment = "Aggregates and BI-facing views consumed by Streamlit / Tableau."
+      comment   = "Aggregates and BI-facing views consumed by Streamlit / Tableau."
       transient = true
     }
     AUDIT = {
-      comment = "Compliance evidence: rejected trades, rule-hit log, dbt run metadata. Append-only, retained longest."
+      comment   = "Compliance evidence: rejected trades, rule-hit log, dbt run metadata. Append-only, retained longest."
       transient = false
     }
     MONITORING = {
-      comment = "Operational observability views over SNOWFLAKE.ACCOUNT_USAGE and pipeline metadata."
+      comment   = "Operational observability views over SNOWFLAKE.ACCOUNT_USAGE and pipeline metadata."
       transient = false
     }
     SNAPSHOTS = {
-      comment = "dbt snapshots -- SCD2 history of the golden record."
+      comment   = "dbt snapshots -- SCD2 history of the golden record."
       transient = false
     }
   }

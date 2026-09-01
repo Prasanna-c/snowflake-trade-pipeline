@@ -20,7 +20,7 @@ variable "alert_recipients" {
     Snowflake user in this account AND be verified, otherwise SYSTEM$SEND_EMAIL
     fails at runtime with "Invalid recipient".
   EOT
-  type = list(string)
+  type        = list(string)
 
   validation {
     condition     = length(var.alert_recipients) > 0

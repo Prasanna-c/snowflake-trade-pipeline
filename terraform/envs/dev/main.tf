@@ -24,8 +24,8 @@ module "warehouses" {
       credit_quota                 = 5
     }
     transform = {
-      size    = "XSMALL"
-      comment = "dbt transformation batch. The only warehouse that scales with trade volume."
+      size         = "XSMALL"
+      comment      = "dbt transformation batch. The only warehouse that scales with trade volume."
       auto_suspend = 60
       # Long backfills are the outlier case; acceleration handles them without
       # permanently paying for a bigger warehouse.

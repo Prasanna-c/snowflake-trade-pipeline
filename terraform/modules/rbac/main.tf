@@ -57,8 +57,8 @@ locals {
   # -------------------------------------------------------------------------
   functional_roles = {
     INGEST = {
-      comment = "Trade file loader. Writes RAW only -- cannot read or alter curated trade data."
-      access  = ["RAW_RW", "MONITORING_R"]
+      comment    = "Trade file loader. Writes RAW only -- cannot read or alter curated trade data."
+      access     = ["RAW_RW", "MONITORING_R"]
       warehouses = ["load"]
     }
     TRANSFORM = {
@@ -74,17 +74,17 @@ locals {
       warehouses = ["transform"]
     }
     ANALYST = {
-      comment = "BI / dashboard persona. Read-only on curated + reporting layers."
+      comment    = "BI / dashboard persona. Read-only on curated + reporting layers."
       access     = ["CORE_R", "REPORTING_R", "SNAPSHOTS_R"]
       warehouses = ["bi"]
     }
     COMPLIANCE = {
-      comment = "Audit persona. Can read rejected trades and the full rule-hit log."
+      comment    = "Audit persona. Can read rejected trades and the full rule-hit log."
       access     = ["AUDIT_R", "CORE_R", "REPORTING_R"]
       warehouses = ["bi"]
     }
     PLATFORM = {
-      comment = "Platform engineer. Operates warehouses and tasks, reads everything."
+      comment    = "Platform engineer. Operates warehouses and tasks, reads everything."
       access     = [for k in keys(local.access_roles) : k if endswith(k, "_R")]
       warehouses = ["load", "transform", "bi"]
     }

@@ -98,7 +98,7 @@ resource "snowflake_masking_policy" "counterparty_name" {
     end
   SQL
 
-  comment       = "Redacts counterparty legal name for non-privileged roles."
+  comment               = "Redacts counterparty legal name for non-privileged roles."
   exempt_other_policies = false
 }
 

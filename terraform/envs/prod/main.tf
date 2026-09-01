@@ -21,15 +21,15 @@ module "warehouses" {
 
   warehouses = {
     load = {
-      size    = "SMALL"
-      comment = "Trade file ingestion. Sized for parallel COPY across many files."
+      size                         = "SMALL"
+      comment                      = "Trade file ingestion. Sized for parallel COPY across many files."
       auto_suspend                 = 60
       statement_timeout_in_seconds = 1800
       credit_quota                 = 200
     }
     transform = {
-      size    = "LARGE"
-      comment = "dbt transformation batch."
+      size         = "LARGE"
+      comment      = "dbt transformation batch."
       auto_suspend = 60
       # Multi-cluster on the batch warehouse absorbs the burst when several
       # micro-batches land at once instead of queueing them serially.
@@ -41,8 +41,8 @@ module "warehouses" {
       credit_quota                 = 1000
     }
     bi = {
-      size    = "MEDIUM"
-      comment = "Interactive BI and Streamlit."
+      size         = "MEDIUM"
+      comment      = "Interactive BI and Streamlit."
       auto_suspend = 300
       # ECONOMY scaling favours queueing over spinning up clusters, which suits
       # dashboards where a 5s wait is acceptable and credits are not.
