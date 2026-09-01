@@ -88,13 +88,13 @@ jobs:
         run: |
           printf '%s' "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/rsa_key.p8"
           chmod 600 "$RUNNER_TEMP/rsa_key.p8"
+          echo "SNOWFLAKE_PRIVATE_KEY_PATH=$RUNNER_TEMP/rsa_key.p8" >> "$GITHUB_ENV"
 
       - name: Init
         working-directory: terraform/envs/prod
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_TERRAFORM_USER }}
-          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
         run: terraform init
 
       - name: Plan
@@ -103,7 +103,6 @@ jobs:
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_TERRAFORM_USER }}
-          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
         run: |
           set +e
           terraform plan -detailed-exitcode -out=tfplan
@@ -168,13 +167,13 @@ jobs:
         run: |
           printf '%s' "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/rsa_key.p8"
           chmod 600 "$RUNNER_TEMP/rsa_key.p8"
+          echo "SNOWFLAKE_PRIVATE_KEY_PATH=$RUNNER_TEMP/rsa_key.p8" >> "$GITHUB_ENV"
 
       - name: Init
         working-directory: terraform/envs/prod
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_TERRAFORM_USER }}
-          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
         run: terraform init
 
       - name: Apply the approved plan
@@ -182,7 +181,6 @@ jobs:
         env:
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
           SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_TERRAFORM_USER }}
-          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
         run: terraform apply -auto-approve tfplan
 
   # ==========================================================================
@@ -213,7 +211,6 @@ jobs:
       SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_PROD_WAREHOUSE }}
       SNOWFLAKE_LOAD_WAREHOUSE: ${{ secrets.SNOWFLAKE_PROD_LOAD_WAREHOUSE }}
       SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_PROD_DATABASE }}
-      SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
       SNOWFLAKE_NOTIFICATION_INTEGRATION: ${{ vars.SNOWFLAKE_NOTIFICATION_INTEGRATION }}
       ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
     steps:
@@ -235,6 +232,7 @@ jobs:
         run: |
           printf '%s' "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/rsa_key.p8"
           chmod 600 "$RUNNER_TEMP/rsa_key.p8"
+          echo "SNOWFLAKE_PRIVATE_KEY_PATH=$RUNNER_TEMP/rsa_key.p8" >> "$GITHUB_ENV"
 
       # Snowflake configuration is set at JOB level rather than repeated per step.
       #
@@ -265,7 +263,6 @@ jobs:
       SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_PROD_ROLE }}
       SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_PROD_WAREHOUSE }}
       SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_PROD_DATABASE }}
-      SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
     steps:
       - uses: actions/checkout@v4
 
@@ -285,6 +282,7 @@ jobs:
         run: |
           printf '%s' "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/rsa_key.p8"
           chmod 600 "$RUNNER_TEMP/rsa_key.p8"
+          echo "SNOWFLAKE_PRIVATE_KEY_PATH=$RUNNER_TEMP/rsa_key.p8" >> "$GITHUB_ENV"
 
       - name: Write the dbt profile
         # dbt/profiles.yml is gitignored, so the runner has none. The example reads every field
@@ -364,7 +362,6 @@ jobs:
       SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_PROD_WAREHOUSE }}
       SNOWFLAKE_LOAD_WAREHOUSE: ${{ secrets.SNOWFLAKE_PROD_LOAD_WAREHOUSE }}
       SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_PROD_DATABASE }}
-      SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
       SNOWFLAKE_NOTIFICATION_INTEGRATION: ${{ vars.SNOWFLAKE_NOTIFICATION_INTEGRATION }}
       ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
     steps:
@@ -386,6 +383,7 @@ jobs:
         run: |
           printf '%s' "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/rsa_key.p8"
           chmod 600 "$RUNNER_TEMP/rsa_key.p8"
+          echo "SNOWFLAKE_PRIVATE_KEY_PATH=$RUNNER_TEMP/rsa_key.p8" >> "$GITHUB_ENV"
 
       - name: Apply
         run: python scripts/deploy_snowflake_sql.py --env prod --phase post-dbt
@@ -420,6 +418,7 @@ jobs:
         run: |
           printf '%s' "${{ secrets.SNOWFLAKE_PRIVATE_KEY }}" > "$RUNNER_TEMP/rsa_key.p8"
           chmod 600 "$RUNNER_TEMP/rsa_key.p8"
+          echo "SNOWFLAKE_PRIVATE_KEY_PATH=$RUNNER_TEMP/rsa_key.p8" >> "$GITHUB_ENV"
 
       - name: Generate docs
         working-directory: dbt
@@ -429,7 +428,6 @@ jobs:
           SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_PROD_ROLE }}
           SNOWFLAKE_WAREHOUSE: ${{ secrets.SNOWFLAKE_PROD_WAREHOUSE }}
           SNOWFLAKE_DATABASE: ${{ secrets.SNOWFLAKE_PROD_DATABASE }}
-          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ runner.temp }}/rsa_key.p8
         # `dbt deps` again, and the profile again, because this job has its own runner. Published
         # on every deploy so the documentation cannot lag the deployed models -- documentation
         # that is generated manually is documentation that is out of date.
