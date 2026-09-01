@@ -124,10 +124,12 @@ jobs:
         # different trades, an expected-verdict mismatch could never be attributed to the
         # pipeline rather than to the generator.
         run: |
-          python -m trade_sim.cli generate --trades 500 --batches 1 --out /tmp/gen-a --seed 7
-          python -m trade_sim.cli generate --trades 500 --batches 1 --out /tmp/gen-b --seed 7
-          a=$(cat /tmp/gen-a/**/*.ndjson.gz | sha256sum | cut -d' ' -f1)
-          b=$(cat /tmp/gen-b/**/*.ndjson.gz | sha256sum | cut -d' ' -f1)
+          TRADE_SIM_OUTPUT_DIR=/tmp/gen-a TRADE_SIM_STATE_DIR=/tmp/state-a \
+            python -m trade_sim.cli generate --trades 500 --batches 1 --seed 7
+          TRADE_SIM_OUTPUT_DIR=/tmp/gen-b TRADE_SIM_STATE_DIR=/tmp/state-b \
+            python -m trade_sim.cli generate --trades 500 --batches 1 --seed 7
+          a=$(find /tmp/gen-a -name '*.ndjson.gz' | sort | xargs cat | sha256sum | cut -d' ' -f1)
+          b=$(find /tmp/gen-b -name '*.ndjson.gz' | sort | xargs cat | sha256sum | cut -d' ' -f1)
           echo "seed 7 digest a=$a"
           echo "seed 7 digest b=$b"
           if [ "$a" != "$b" ]; then
