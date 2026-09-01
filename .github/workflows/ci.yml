@@ -444,7 +444,7 @@ jobs:
         # a pass for a required job -- but every job listed here is unconditional, so any
         # 'skipped' means an upstream failure cancelled it.
         run: |
-          results='${{ join(needs.*.result, " ") }}'
+          results="${{ join(needs.*.result, ' ') }}"
           echo "job results: $results"
           for result in $results; do
             if [ "$result" != "success" ]; then
