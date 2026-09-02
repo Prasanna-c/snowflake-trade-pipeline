@@ -15,14 +15,19 @@ import pytest
 from trade_sim import reference as ref
 from trade_sim.config import SimulatorSettings
 from trade_sim.generator import (
-    CODES_THAT_SURVIVE_THE_FIELD_PHASE,
     FAULT_EXPECTATIONS,
     WARN_ONLY_FAULTS,
     GeneratedEvent,
     TradeBook,
     TradeGenerator,
+    _business_time,
 )
 from trade_sim.schema import TradeEvent
+
+#: The codes the STATE phase issues, per the phase column in trade_validation_rules.sql.
+#: These are the only ones a manifest can reach from the ordering of a batch; every other
+#: code is a FIELD finding, decided by the fault injected rather than by arbitration.
+STATE_PHASE_RULE_CODES = frozenset({"RJ001", "RJ009", "RJ010"})
 
 
 class TestDeterminism:
@@ -439,6 +444,61 @@ class TestManifestAgreesWithArbitration:
     def _in_time_order(events: list[GeneratedEvent]) -> list[GeneratedEvent]:
         return sorted(events, key=lambda e: datetime.fromisoformat(e.payload["event_timestamp"]))
 
+    @staticmethod
+    def _replay_the_model(
+        events: list[GeneratedEvent], stored_versions: dict[str, int]
+    ) -> dict[int, tuple[str, list[str]]]:
+        """The verdict int_trade_event_adjudicated will reach for each event, by position.
+
+        Reproduces the model's two window functions instead of restating one invariant at a
+        time. `intra_run_rank` partitions by (trade_id, trade_version, is_field_valid) and
+        orders on business time then arrival, so the latest arrival of a version takes rank
+        1 and a malformed resend ranks in a partition of its own. `effective_prior_version`
+        is the highest version among rank-1, field-valid events that precede the arrival in
+        business time, floored by the version the warehouse already stored.
+
+        Position in the batch stands in for event_sk, which the model derives from arrival
+        order within the file.
+        """
+        partitions: dict[tuple[str, int, bool], list[int]] = {}
+        for position, event in enumerate(events):
+            if event.trade_id and event.trade_version:
+                key = (event.trade_id, event.trade_version, event.field_valid)
+                partitions.setdefault(key, []).append(position)
+
+        rank: dict[int, int] = {}
+        for members in partitions.values():
+            latest_first = sorted(
+                members, key=lambda p: (_business_time(events[p]), p), reverse=True
+            )
+            for offset, position in enumerate(latest_first, start=1):
+                rank[position] = offset
+
+        by_trade: dict[str, list[int]] = {}
+        for position in rank:
+            by_trade.setdefault(str(events[position].trade_id), []).append(position)
+
+        predicted: dict[int, tuple[str, list[str]]] = {}
+        for trade_id, positions in by_trade.items():
+            mark = stored_versions.get(trade_id, 0)
+            for position in sorted(positions, key=lambda p: (_business_time(events[p]), p)):
+                event = events[position]
+                version = event.trade_version or 0
+
+                if not event.field_valid:
+                    # The STATE phase is evaluated for every row, so a field-invalid
+                    # arrival is still stale when a higher version precedes it. It moves no
+                    # mark and enters no race: the mark admits only field-valid rows.
+                    predicted[position] = ("REJECTED", ["RJ001"] if version < mark else [])
+                elif rank[position] > 1:
+                    predicted[position] = ("SUPERSEDED", ["RJ009"])
+                elif version < mark:
+                    predicted[position] = ("REJECTED", ["RJ001"])
+                else:
+                    predicted[position] = ("ACCEPTED", [])
+                    mark = version
+        return predicted
+
     def test_no_version_is_expected_to_be_accepted_twice(
         self, sim_settings: SimulatorSettings
     ) -> None:
@@ -475,9 +535,11 @@ class TestManifestAgreesWithArbitration:
             mark = 0
             for event in self._in_time_order(group):
                 if event.expected_verdict == "SUPERSEDED":
-                    # RJ009 outranks RJ001 in the verdict: losing the race is reported
-                    # instead of staleness, and the loser test below covers it.
-                    mark = max(mark, event.trade_version or 0)
+                    # Two reasons to pass over a superseded arrival. Its own verdict is not
+                    # a staleness claim: RJ009 outranks RJ001 deliberately, and the loser
+                    # test below covers it. And it does not move the mark either, because
+                    # the model's window admits only rank-1 events -- an arrival that lost
+                    # its race is not history, so it cannot make a later version stale.
                     continue
                 declared_stale = "RJ001" in event.expected_rule_codes
                 assert declared_stale == ((event.trade_version or 0) < mark), (
@@ -485,6 +547,45 @@ class TestManifestAgreesWithArbitration:
                     f"{event.expected_verdict} {event.expected_rule_codes}"
                 )
                 mark = max(mark, event.trade_version or 0)
+
+    def test_every_expectation_matches_a_replay_of_the_model(
+        self, sim_settings: SimulatorSettings
+    ) -> None:
+        """The whole STATE phase at once, rather than one invariant at a time.
+
+        The tests around this one each replay a single rule, which leaves the corners where
+        two rules meet unexamined -- and that is where the manifest was wrong. A resend the
+        field phase had already disqualified was still counted into its version's race, so
+        the good arrival it never competed with was expected to be superseded; and a resend
+        stamped before the amendment that overtook it was expected stale, because the book
+        advances in emission order while the model reads the clock. Both survived every
+        rule-at-a-time test here and surfaced as a mass reconciliation failure after a full
+        warehouse round trip. This replays rank, mark and verdict together instead.
+
+        Against a warm book as well as a cold one: the second batch's mark is floored by the
+        versions the first one left behind, which is the path a re-run takes.
+        """
+        book = TradeBook(path=sim_settings.state_dir / "replayed.json")
+        self._batch(sim_settings, 800, book=book)
+        stored_versions = {tid: entry.trade_version for tid, entry in book.trades.items()}
+        assert stored_versions, (
+            "the first batch must leave versions behind, or the floor is untested"
+        )
+
+        _, events = self._batch(sim_settings, 1500, book=book)
+
+        for position, (verdict, codes) in self._replay_the_model(events, stored_versions).items():
+            event = events[position]
+            assert event.expected_verdict == verdict, (
+                f"{event.trade_id} v{event.trade_version} "
+                f"(fault={event.injected_fault}, field_valid={event.field_valid}): "
+                f"the model reaches {verdict}, the manifest promises {event.expected_verdict}"
+            )
+            promised = set(event.expected_rule_codes) & STATE_PHASE_RULE_CODES
+            assert promised <= set(codes), (
+                f"{event.trade_id} v{event.trade_version}: the manifest promises "
+                f"{sorted(promised)}, the model fires {codes}"
+            )
 
     def test_a_warn_only_fault_does_not_rescue_a_late_arrival(
         self, sim_settings: SimulatorSettings
@@ -553,13 +654,9 @@ class TestManifestAgreesWithArbitration:
 
         groups: dict[tuple[str, int], list[GeneratedEvent]] = {}
         for event in events:
-            if (
-                event.trade_id
-                and event.trade_version
-                and all(
-                    code in CODES_THAT_SURVIVE_THE_FIELD_PHASE for code in event.expected_rule_codes
-                )
-            ):
+            # Field-valid arrivals only, which is how the model partitions the ranking: a
+            # malformed resend races nothing and supersedes nothing.
+            if event.trade_id and event.trade_version and event.field_valid:
                 groups.setdefault((event.trade_id, event.trade_version), []).append(event)
 
         raced = [group for group in groups.values() if len(group) > 1]

@@ -214,13 +214,6 @@ WARN_ONLY_FAULTS: frozenset[str] = frozenset({"notional_over_limit"})
 IDENTITY_DESTROYING_FAULTS: frozenset[str] = frozenset({"unparseable_json", "missing_trade_id"})
 
 
-#: Codes an event can carry and still have reached version arbitration. Every other rule
-#: is a FIELD-phase rejection, and a field-invalid event is excluded from the ranking --
-#: which is what stops a malformed resend from displacing a good arrival. Mirrors the
-#: FIELD/STATE split in trade_validation_rules.sql.
-CODES_THAT_SURVIVE_THE_FIELD_PHASE = frozenset({"RJ001", "RJ009", "RJ010", "RJ018", "RJ019"})
-
-
 #: Earliest orderable business time, used when an event has none to offer. Timezone-aware
 #: because every real payload timestamp is, and Python refuses to compare the two kinds.
 _BEFORE_ANY_EVENT = datetime.min.replace(tzinfo=UTC)
@@ -247,42 +240,70 @@ def _business_time(event: GeneratedEvent) -> datetime:
         return _BEFORE_ANY_EVENT
 
 
-def _resolve_same_version_races(events: list[GeneratedEvent]) -> None:
-    """Apply business rule 2 to the batch's own expectations, in place.
+def _settle_version_arbitration(
+    events: list[GeneratedEvent], stored_versions: dict[str, int]
+) -> None:
+    """Re-express the batch's expectations the way the STATE phase will reach them.
 
-    Several events can legitimately share a (trade_id, trade_version): that is the
-    same-version resend the rule exists for. The pipeline keeps the arrival with the
-    latest business time and records every earlier one as SUPERSEDED under RJ009. An
-    expectation computed as an event is emitted cannot know that a later event will
-    supersede it, so the batch is revisited once it is complete.
+    Two of the model's decisions are unknowable as an event is emitted, so the batch is
+    revisited in place once it is complete.
 
-    RJ009 outranks a rejection in the verdict, deliberately -- a superseded event is not a
-    data quality failure -- so a late-arriving stale version that loses a race is reported
-    as SUPERSEDED rather than as the RJ001 it would otherwise have been. The losers here
-    are re-expected the same way.
+    Rule 2, the same-version race. Several events can legitimately share a (trade_id,
+    trade_version): that is the resend the rule exists for. The model ranks them on
+    business time and records every arrival but the latest as SUPERSEDED under RJ009,
+    which outranks a rejection deliberately -- losing a race is not a data quality
+    failure. The ranking partitions by `is_field_valid`, so a malformed resend is in a
+    partition of its own: it neither supersedes a good arrival nor is superseded by one,
+    and answers for its own bad field alone.
 
-    Ordering mirrors `intra_run_rank` in int_trade_event_adjudicated: business time first,
-    and on a tie the later position in the file, which becomes the higher event_sk. The
-    sort is stable, so position falls out of it without a second key.
+    Rule 1, staleness. RJ001 compares the arrival against `effective_prior_version`: the
+    highest version that precedes it *in business time* among the race winners, floored by
+    the version the warehouse already stored. The book cannot answer that, because it
+    advances in emission order -- a resend stamped before the amendment that overtook it
+    is late to the book and in perfect order on the clock the model reads. Where the two
+    disagree the clock wins, because that is what the warehouse will do.
+
+    Ordering mirrors `intra_run_rank`: business time first, and on a tie the later
+    position in the file, which becomes the higher event_sk. The sort is stable, so
+    position falls out of it without a second key.
     """
     contenders: dict[tuple[str, int], list[GeneratedEvent]] = defaultdict(list)
     for event in events:
-        if (
-            event.trade_id is not None
-            and event.trade_version is not None
-            and all(
-                code in CODES_THAT_SURVIVE_THE_FIELD_PHASE for code in event.expected_rule_codes
-            )
-        ):
+        if event.trade_id is not None and event.trade_version is not None and event.field_valid:
             contenders[(event.trade_id, event.trade_version)].append(event)
 
-    for competing in contenders.values():
-        if len(competing) < 2:
-            continue
+    # Only the winner of each race moves the mark, matching the rank-1 restriction on the
+    # model's window. A superseded event is not history, so a version that lost a race
+    # cannot make a later arrival stale.
+    winners: dict[str, list[tuple[datetime, int]]] = defaultdict(list)
+    for (trade_id, trade_version), competing in contenders.items():
         competing.sort(key=_business_time)
         for loser in competing[:-1]:
             loser.expected_verdict = "SUPERSEDED"
             loser.expected_rule_codes = ["RJ009"]
+        winners[trade_id].append((_business_time(competing[-1]), trade_version))
+
+    for event in events:
+        if event.trade_id is None or "RJ001" not in event.expected_rule_codes:
+            continue
+        arrived_at = _business_time(event)
+        mark = max(
+            [stored_versions.get(event.trade_id, 0)]
+            + [
+                trade_version
+                for when, trade_version in winners.get(event.trade_id, [])
+                if when < arrived_at
+            ]
+        )
+        if (event.trade_version or 0) < mark:
+            continue
+
+        # Nothing precedes it, so the version rules never reach it and the FIELD phase
+        # decides alone: acquittal for an event whose fields are sound, and the fault's
+        # own codes for one whose fields are not.
+        event.expected_rule_codes = [code for code in event.expected_rule_codes if code != "RJ001"]
+        if event.field_valid and not event.expected_rule_codes:
+            event.expected_verdict = "ACCEPTED"
 
 
 def _codes_for_reference_token(token: str, unknown_code: str) -> list[str]:
@@ -310,6 +331,14 @@ class GeneratedEvent:
     expected_verdict: str
     expected_rule_codes: list[str]
 
+    #: Whether the FIELD phase will let this event through to version arbitration, which
+    #: is `is_field_valid` in int_trade_event_adjudicated. It decides which events compete
+    #: in a same-version race and which move the high-water mark, so the manifest cannot
+    #: infer it from the expected codes: a late arrival carrying a bad field declares
+    #: RJ001 from the STATE phase and would otherwise look field-valid. Not carried into
+    #: the manifest -- it is how an expectation is reached, not part of the expectation.
+    field_valid: bool = True
+
 
 class TradeGenerator:
     """Produces trade events against a persistent trade book."""
@@ -320,6 +349,7 @@ class TradeGenerator:
         self.faker = Faker()
         Faker.seed(settings.seed)
         self.book = book or TradeBook.load(settings.state_dir / "trade_book.json")
+        self._versions_at_batch_start: dict[str, int] = {}
 
         # Pre-compute the weighted product distribution once.
         self._product_pool: tuple[ref.Product, ...] = tuple(
@@ -605,6 +635,13 @@ class TradeGenerator:
         """Yield `count` events, updating the trade book as it goes."""
         as_of = as_of or date.today()
 
+        # The versions the warehouse already holds, read before the batch moves them. It is
+        # the floor under this batch's high-water mark: a resend of a version an earlier
+        # batch published is stale on arrival, with nothing in this batch to say so.
+        self._versions_at_batch_start = {
+            trade_id: entry.trade_version for trade_id, entry in self.book.trades.items()
+        }
+
         # Identifiers, never entries. `book.record()` replaces the entry object, so a
         # cached entry goes stale the moment its trade is updated, and a stale entry
         # carries a stale version number and a stale business timestamp -- enough to issue
@@ -722,6 +759,9 @@ class TradeGenerator:
                     trade_version=event.trade_version if is_identifiable else None,
                     action=event.action.value if is_identifiable else None,
                     injected_fault=corrupt.injected_fault,
+                    # Every catalogued fault but the warn-only one trips a REJECT-severity
+                    # FIELD rule, which is what puts the event outside the ranking.
+                    field_valid=is_warn_only,
                     expected_verdict="ACCEPTED" if is_warn_only and not is_late else "REJECTED",
                     # A late arrival is refused on its version, and RJ001 alone is certain.
                     # Claiming the codes of the fault as well asserts that the field phase
@@ -776,7 +816,7 @@ class TradeGenerator:
         self, events: list[GeneratedEvent], *, batch_ref: str, file_name: str
     ) -> BatchManifest:
         """Summarise a batch into the ground truth used by `trade-sim reconcile`."""
-        _resolve_same_version_races(events)
+        _settle_version_arbitration(events, self._versions_at_batch_start)
 
         fault_counts: dict[str, int] = {}
         rule_counts: dict[str, int] = {}
