@@ -115,7 +115,6 @@ make generate          # write trade files to ./data
 | [`monitoring.md`](docs/monitoring.md) | Every monitor, alert and threshold, and why that number |
 | [`scalability.md`](docs/scalability.md) | What breaks first at 100×, 1,000× and 10,000× |
 | [`adr/`](docs/adr/README.md) | Ten decision records, including the alternatives rejected |
-| [`interview-notes.md`](docs/interview-notes.md) | The design questions, answered |
 
 Every alert this platform emits links to a runbook section, and `make selfcheck` fails if a link
 points at a heading that does not exist — so the documentation cannot silently drift from the code
