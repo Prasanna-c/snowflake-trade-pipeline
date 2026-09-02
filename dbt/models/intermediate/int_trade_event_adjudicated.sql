@@ -89,13 +89,16 @@ prior_state as (
         and trade_id is not null
     group by trade_id
     {% else %}
-    -- Typed empty relation so the joins below compile identically in both branches.
+    -- No prior state exists yet. Shaped from the upstream relation and filtered to
+    -- nothing, so the column types come from the same expressions as the branch above.
     select
-        cast(null as varchar) as trade_id,
-        cast(null as number(38, 0)) as prior_version,
-        cast(null as boolean) as prior_is_cancelled
+        trade_id,
+        max(trade_version) as prior_version,
+        max(iff(action = 'CANCEL', 1, 0)) = 1 as prior_is_cancelled
+    from {{ ref('int_trade_event_typed') }}
     where false
-{% endif %}
+    group by trade_id
+    {% endif %}
 
 ),
 

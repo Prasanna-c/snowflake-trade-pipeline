@@ -89,13 +89,13 @@ newly_accepted as (
 
 ),
 
+{% if is_incremental() %}
 -- ---------------------------------------------------------------------------
 -- (b) The expiry sweep. Only on an incremental run -- on a full refresh, population
 -- (a) is the entire history and every status is computed from scratch anyway.
 -- ---------------------------------------------------------------------------
 needs_expiry as (
 
-    {% if is_incremental() %}
     select existing.*
     from {{ this }} as existing
     where existing.maturity_date is not null
@@ -108,13 +108,9 @@ needs_expiry as (
             select 1 from newly_accepted as na
             where na.trade_id = existing.trade_id
         )
-    {% else %}
-    select
-        cast(null as varchar) as trade_id
-    where false
-{% endif %}
 
 ),
+{% endif %}
 
 -- ---------------------------------------------------------------------------
 -- Population (a), shaped into the final grain.
@@ -188,6 +184,7 @@ from_new_events as (
 
 ),
 
+{% if is_incremental() %}
 -- ---------------------------------------------------------------------------
 -- Population (b), re-emitted with the transitioned status. Every other column is
 -- carried through untouched: this is a status transition, not a restatement, and
@@ -195,7 +192,6 @@ from_new_events as (
 -- ---------------------------------------------------------------------------
 from_expiry_sweep as (
 
-    {% if is_incremental() %}
     select
         needs_expiry.trade_id,
         needs_expiry.current_version,
@@ -251,17 +247,17 @@ from_expiry_sweep as (
         '{{ invocation_id }}' as dbt_invocation_id
 
     from needs_expiry
-    {% else %}
-    select * from from_new_events where false
-{% endif %}
 
 ),
+{% endif %}
 
 combined as (
 
     select * from from_new_events
+    {% if is_incremental() %}
     union all
     select * from from_expiry_sweep
+    {% endif %}
 
 ),
 
